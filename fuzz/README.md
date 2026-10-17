@@ -82,7 +82,21 @@ Without its oracle such a target exits with an error rather than comparing
 nothing. Each asserts only on inputs libjpeg decodes without a warning, and
 skips divergences already filed (each skip names its LAST_MILE item);
 `LTRS_FUZZ_INCLUDE_KNOWN=1` turns those skips off, to confirm the target still
-finds them or that a fix closed them. Their seeds come from
+finds them or that a fix closed them. A target excuses a mismatch only when it matches a filed
+class (checked after the comparison, so the input still exercises the code):
+a scaled decode of coefficients no 8-bit image produces (the scaled IDCTs
+saturate by design), 0xFF fill before a stuffed byte (P4-248), raw output that
+equals libjpeg's with smoothing off (P4-249), lossless Tq/Ta above 3 (P4-250).
+P4-66 cannot be excused reliably — its effect spreads through later
+predictions — so lossless findings below 16 bits need replaying against a
+build that wraps modulo 2^16.
+
+`fuzz/known_divergences/<target>/` keeps one input per class, outside the
+corpora so a run does not stop on them: replay with
+`LTRS_FUZZ_INCLUDE_KNOWN=1` to confirm each still diverges, or that a fix
+closed it. The first campaign (2026-10-17, one hour on a 20-core aarch64 host,
+about 44 million executions across the three targets) found only those
+classes. Their seeds come from
 `fuzz/scripts/make_c_oracle_diff_seeds.py <cjpeg 3.x>`, which includes a small
 T.81 lossless encoder for layouts `cjpeg` cannot write; the
 `diffseed_lossless_*` files it writes into `fuzz_decompress_precision/` too.

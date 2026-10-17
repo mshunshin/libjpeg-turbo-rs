@@ -1372,6 +1372,8 @@ C expands instead of ignoring: `djpeg -rgb` on a `cjpeg -precision 12` grayscale
 
 **Acceptance criteria.** `undifference_row_16` wraps modulo 0xFFFF like C, with the sample-type truncation left to the output upscale stage (mirroring the P4-38 fix); a crafted wrapping 12-bit lossless fixture cross-validated against `djpeg` (3.x decodes 12-bit lossless); a note in the fix on whether the 12-as-8 route (`decode_12bit_as_8bit`, P4-65) shares the defect.
 
+**Progress (2026-10-17).** Not 12-bit only: `decompress_lossless_arbitrary` masks every precision below 16 the same way, and `fuzz_lossless_diff_c` hit it on 8-bit frames (11 findings in a one-hour 20-core campaign). Because the masked sample predicts its neighbours, one wrapped sum changes later samples too, so the divergence spreads along the row and into later rows rather than staying where a mask comparison would find it. An experimental build that wraps at 0xFFFF and masks only at output matched libjpeg byte for byte on all 11. Reproducer: `fuzz/known_divergences/fuzz_lossless_diff_c/p4_66_lossless_wrap_8bit.jpg`.
+
 ## P4-67. `apply_orientation` Strided Reads Are Cache-Hostile for Orientations 5-8 — **OPEN**
 
 **Motivation.** Filed 2026-07-28 from the #391 code review. `Image::apply_orientation_value` (now `src/decode/pipeline_impl/api.rs`) walks the destination sequentially, so for the axis-swapping orientations (5-8) the source advances by `width * bpp` per inner-loop iteration — on a 4032 px-wide 12 MP phone photo (the feature's headline case) that is a ~12 KB stride at 3 bpp (~16 KB for RGBA), roughly one cache miss per pixel. A tiled transpose (32x32 or 64x64 blocks) is typically 3-6x faster on this shape (review estimate from the general pattern; not measured on this code — the acceptance criteria below require the before/after benchmark). Secondarily, the loop-invariant `match orientation` sits inside the inner loop; hoisting it to a per-orientation strategy would also let 3 degrade to whole-row reversed copies and 4 to row swaps.
@@ -14128,4 +14130,72 @@ Acceptance: `fuzz_lossless_diff_c` with `LTRS_FUZZ_INCLUDE_KNOWN=1` passes
 over its seeds — restart and subsampled frames byte-identical to libjpeg,
 multi-scan frames decoded or (as a documented decision) refused — and the
 corresponding skips are removed from the target.
+
+## P4-248. A 0xFF Fill Byte Before a Stuffed Byte Mis-Decodes Baseline 4:4:4, 4:2:2 and 4:1:1 Silently — **OPEN**
+
+Found by `fuzz_ycbcr_diff_c` on 2026-10-17. In entropy-coded data a run of
+0xFF bytes followed by 0x00 — fill before a stuffed byte — is read by libjpeg
+as one stuffed 0xFF (`jdhuff.c` `jpeg_fill_bit_buffer` skips the extra 0xFF),
+without a warning. P4-242 (#678) added that recovery, and
+`tests/marker_stray_bytes.rs::entropy_fill_before_stuffed_byte_is_warning_free`
+pins it, but only on a progressive 4:2:0 stream. The same recipe — the test's
+own 128×128 noise image, one extra 0xFF before the first `FF 00` in the scan
+— on a **baseline** stream gives:
+
+| `cjpeg -sample` | baseline | progressive |
+|---|---|---|
+| `2x2` (4:2:0) | identical | identical |
+| `1x1` (4:4:4) | 151 of 49152 bytes differ | identical |
+| `2x1` (4:2:2) | 151 differ | identical |
+| `4x1` (4:1:1) | 149 differ | identical |
+| `1x2` (4:4:0) | identical | identical |
+
+`djpeg -strict` accepts every one (exit 0); `Decoder` strict and lenient
+return `Ok` with no warning. On the fuzzer's 61×45 4:4:0 input the fill run
+was 64 bytes long and `read_coefficients` returned 0 where libjpeg (via
+`jpegtran -copy none`) has −1 for most AC coefficients of two blocks; any run
+of two or more 0xFF diverged, a lone `FF 00` did not. The baseline Huffman
+path for these layouts does not skip fill the way the progressive path does.
+Reproducer: `fuzz/known_divergences/fuzz_ycbcr_diff_c/p4_248_fill_before_stuffed_byte.bin`
+(3-byte option prefix, then the JPEG).
+
+Acceptance: the P4-242 test extended to baseline streams of every standard
+sampling layout, byte-identical to `djpeg -strict`; the C-oracle targets'
+P4-248 skip removed.
+
+## P4-249. `decode_raw` Skips Block Smoothing That libjpeg's Raw Output Applies — **OPEN**
+
+Found by `fuzz_raw_diff_c` on 2026-10-17 (13 of 13 raw findings in a one-hour
+20-core campaign). `Decoder::decode_raw` documents itself as libjpeg's
+`jpeg_read_raw_data()`, but passes `block_smoothing = false` to the
+progressive plane decoder (`src/decode/pipeline_impl/raw.rs`, "raw data
+decode: no block smoothing"). libjpeg's default `do_block_smoothing = TRUE`
+applies to raw output too: for a progressive stream whose scans stop before
+the last bit of some coefficients (Al > 0 left, or AC bands never sent), the
+coefficient controller smooths, and the raw planes differ from Rust's by a
+few levels across whole blocks. `examples/raw_decode_c_oracle.c nosmooth`
+(libjpeg with smoothing off) agrees with `decode_raw` on every such input.
+Fully refined progressive streams and all sequential streams are unaffected.
+
+Acceptance: either `decode_raw` honours `set_block_smoothing` (default on, as
+libjpeg) and matches `raw_decode_c_oracle` byte for byte, or the rustdoc
+states the deliberate difference; the target's P4-249 excuse removed or kept
+to match. Reproducer: `fuzz/known_divergences/fuzz_raw_diff_c/p4_249_raw_block_smoothing.jpg`.
+
+## P4-250. Lossless Decode Refuses Tq or Ta Above 3, Which libjpeg Ignores — **OPEN**
+
+Found by `fuzz_lossless_diff_c` on 2026-10-17 (12 findings). A lossless frame
+uses neither the SOF quantization table selector Tq nor the SOS AC table
+selector Ta; T.81 Tables B.2 and B.3 give both as 0 for lossless, and libjpeg
+neither checks nor uses them in lossless mode. The shared header parser
+(`src/decode/marker.rs`, "quantization table index … out of range (0-3)" and
+"Huffman table index out of range") range-checks them for every frame type,
+so a lossless frame with Tq or Ta of 4 or more is refused as `CorruptData`
+where libjpeg decodes it. Real encoders seen so far write 0–2 (GE Vingmed:
+Tq = 1–2, with Se = 63, which this decoder already ignores and libjpeg
+refuses). Reproducers:
+`fuzz/known_divergences/fuzz_lossless_diff_c/p4_250_lossless_{tq,ta}_out_of_range.jpg`.
+
+Acceptance: SOF3/SOF11 frames accept any Tq and Ta (or the refusal is a
+documented decision); the target's P4-250 skip removed.
 

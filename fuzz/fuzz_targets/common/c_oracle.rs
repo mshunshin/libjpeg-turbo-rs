@@ -112,3 +112,57 @@ pub fn first_differences(ours: &[u8], theirs: &[u8], channels: usize, limit: usi
         .collect::<Vec<String>>()
         .join(", ")
 }
+
+/// P4-248: the entropy-coded data holds a run of two or more 0xFF before a
+/// 0x00. libjpeg skips the extra 0xFF as fill and reads one stuffed 0xFF;
+/// the baseline decoder here reads it differently for some layouts, with no
+/// warning on either side.
+pub fn has_fill_before_stuffed_zero(jpeg: &[u8]) -> bool {
+    let Some(sos) = jpeg.windows(2).position(|w| w == [0xFF, 0xDA]) else {
+        return false;
+    };
+    let entropy: &[u8] = &jpeg[sos + 2..];
+    let mut i: usize = 0;
+    while i < entropy.len() {
+        if entropy[i] != 0xFF {
+            i += 1;
+            continue;
+        }
+        let run_start: usize = i;
+        while i < entropy.len() && entropy[i] == 0xFF {
+            i += 1;
+        }
+        if i - run_start >= 2 && entropy.get(i) == Some(&0x00) {
+            return true;
+        }
+    }
+    false
+}
+
+/// The largest |coefficient × quantizer| in the stream, or `None` when the
+/// coefficients cannot be read. A DCT of 8-bit samples never exceeds 2047;
+/// beyond that, the scaled IDCTs saturate where libjpeg's scalar
+/// `range_limit[x & RANGE_MASK]` wraps — a deliberate choice documented in
+/// `src/decode/idct_scaled.rs`, matching libjpeg's own NEON kernels, not a
+/// defect to report.
+pub fn max_dequantized_coefficient(jpeg: &[u8]) -> Option<i64> {
+    let coefficients = libjpeg_turbo_rs::read_coefficients(jpeg).ok()?;
+    coefficients
+        .components
+        .iter()
+        .flat_map(|component| {
+            let quant = coefficients
+                .quant_tables
+                .get(usize::from(component.quant_table_index));
+            component.blocks.iter().flat_map(move |block| {
+                block
+                    .iter()
+                    .enumerate()
+                    .map(move |(k, &v)| i64::from(v).abs() * quant.map_or(1, |q| i64::from(q[k])))
+            })
+        })
+        .max()
+}
+
+/// Above this a dequantized coefficient cannot come from 8-bit samples.
+pub const MAX_LEGAL_DEQUANTIZED: i64 = 2047;

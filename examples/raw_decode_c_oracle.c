@@ -9,7 +9,11 @@
  * `raw_data_out = TRUE` and reports each plane's active area for
  * `fuzz/fuzz_targets/fuzz_raw_diff_c.rs`.
  *
- * usage: raw_decode_c_oracle <infile>     ("/dev/stdin" reads a pipe)
+ * usage: raw_decode_c_oracle <infile> [nosmooth]   ("/dev/stdin" reads a pipe)
+ *
+ * libjpeg applies its default inter-block smoothing (`do_block_smoothing`)
+ * to raw output too, for progressive scans not refined to the last bit;
+ * `nosmooth` turns it off, which is how `decode_raw` decodes (P4-249).
  *
  * Output on stdout: `RAW <components>\n`, then for each component
  * `<width> <height>\n` followed by width*height samples, row by row. The
@@ -49,8 +53,8 @@ int main(int argc, char **argv)
   JDIMENSION imcu_rows, imcu_row = 0, lines_per_imcu;
   int ci;
 
-  if (argc != 2) {
-    fprintf(stderr, "usage: %s <infile>\n", argv[0]);
+  if (argc != 2 && !(argc == 3 && strcmp(argv[2], "nosmooth") == 0)) {
+    fprintf(stderr, "usage: %s <infile> [nosmooth]\n", argv[0]);
     return 2;
   }
   in = fopen(argv[1], "rb");
@@ -64,6 +68,8 @@ int main(int argc, char **argv)
   jpeg_stdio_src(&cinfo, in);
   jpeg_read_header(&cinfo, TRUE);
   cinfo.raw_data_out = TRUE;
+  if (argc == 3)
+    cinfo.do_block_smoothing = FALSE;
   jpeg_start_decompress(&cinfo);
 
   lines_per_imcu = (JDIMENSION)(cinfo.max_v_samp_factor * MIN_DCT_V_SIZE(&cinfo));

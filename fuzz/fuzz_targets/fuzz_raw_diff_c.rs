@@ -15,14 +15,17 @@
 //!
 //! Skips: arithmetic-coded streams (the open divergence
 //! `fuzz_decode_diff_c` also skips), and precisions other than 8 and
-//! lossless frames, which both decoders refuse for raw output.
+//! lossless frames, which both decoders refuse for raw output. A mismatch is
+//! excused, unless `LTRS_FUZZ_INCLUDE_KNOWN=1`, when libjpeg without block
+//! smoothing agrees with Rust (P4-249) or the entropy data holds 0xFF fill
+//! before a stuffed byte (P4-248).
 
 #![no_main]
 
 #[path = "common/c_oracle.rs"]
 mod c_oracle;
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 
 use libfuzzer_sys::fuzz_target;
@@ -54,6 +57,33 @@ fn parse_raw(stdout: &[u8]) -> Vec<(usize, usize, Vec<u8>)> {
             (w, h, plane)
         })
         .collect()
+}
+
+/// A raw mismatch with a filed explanation: libjpeg smooths progressive
+/// scans not refined to the last bit and `decode_raw` does not (P4-249, so
+/// Rust equals libjpeg with `nosmooth`), or 0xFF fill before a stuffed byte
+/// (P4-248).
+fn known_raw_divergence(
+    oracle: &Path,
+    data: &[u8],
+    raw: &libjpeg_turbo_rs::RawImage,
+    active: &[(usize, usize)],
+) -> bool {
+    if c_oracle::has_fill_before_stuffed_zero(data) {
+        return true;
+    }
+    let args: [String; 2] = ["/dev/stdin".to_string(), "nosmooth".to_string()];
+    let Some(unsmoothed) = c_oracle::run_oracle(oracle, &args, data) else {
+        return false;
+    };
+    parse_raw(&unsmoothed.stdout)
+        .iter()
+        .zip(active)
+        .enumerate()
+        .all(|(ci, ((_, _, plane), &(w, h)))| {
+            let stride: usize = raw.plane_widths[ci];
+            (0..h).all(|y| raw.planes[ci][y * stride..y * stride + w] == plane[y * w..(y + 1) * w])
+        })
 }
 
 fuzz_target!(|data: &[u8]| {
@@ -140,6 +170,10 @@ fuzz_target!(|data: &[u8]| {
             .flat_map(|y| raw.planes[ci][y * stride..y * stride + rw].iter().copied())
             .collect();
         if ours != *c_plane {
+            if !c_oracle::include_known_gaps() && known_raw_divergence(oracle, data, &raw, &active)
+            {
+                return;
+            }
             let differing: usize = ours.iter().zip(c_plane).filter(|(a, b)| a != b).count();
             panic!(
                 "raw component {ci} ({rw}x{rh}) diverges from libjpeg: {differing} samples differ; first: {}",

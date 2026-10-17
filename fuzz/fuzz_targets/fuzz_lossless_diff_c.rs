@@ -19,6 +19,8 @@
 //!   a first scan coding fewer components than the frame, which libjpeg
 //!   decodes across its later scans and this entry point refuses (P4-75 made
 //!   that a `CorruptData` refusal; 0.8.0 panicked).
+//! - P4-250: a frame-header Tq or first-scan Ta above 3, which libjpeg
+//!   ignores in lossless mode and Rust refuses.
 //! - P4-66: below 16 bits, where libjpeg carries a corrupt difference's sum
 //!   modulo 2^16 and Rust masks it to the precision.
 
@@ -47,6 +49,8 @@ struct Layout {
     /// `(h, v)` sampling factors per component.
     sampling: Vec<(u8, u8)>,
     first_scan_components: Option<u8>,
+    /// The largest Tq in the frame header and Ta in the first scan header.
+    max_unused_selector: u8,
     restart_interval: bool,
 }
 
@@ -81,6 +85,10 @@ fn read_layout(data: &[u8]) -> Option<Layout> {
                     height: u64::from(u16::from_be_bytes([*segment.get(1)?, *segment.get(2)?])),
                     sampling,
                     first_scan_components: None,
+                    max_unused_selector: (0..components)
+                        .filter_map(|k| segment.get(8 + 3 * k).copied())
+                        .max()
+                        .unwrap_or(0),
                     restart_interval: false,
                 });
             }
@@ -92,6 +100,12 @@ fn read_layout(data: &[u8]) -> Option<Layout> {
             0xDA => {
                 let mut layout: Layout = layout?;
                 layout.first_scan_components = segment.first().copied();
+                let ns: usize = usize::from(segment.first().copied().unwrap_or(0));
+                layout.max_unused_selector = (0..ns)
+                    .filter_map(|k| segment.get(2 + 2 * k).map(|&tdta| tdta & 0x0F))
+                    .chain([layout.max_unused_selector])
+                    .max()
+                    .unwrap_or(0);
                 // A DRI may also follow the first scan; any non-zero one in the
                 // rest of the stream counts. (0xFF 0xDD cannot occur in valid
                 // entropy-coded data.)
@@ -135,6 +149,11 @@ fuzz_target!(|data: &[u8]| {
         }
         // P4-247 (2): subsampled multi-component frames decode wrong.
         if layout.sampling.len() > 1 && layout.sampling.iter().any(|&s| s != (1, 1)) {
+            return;
+        }
+        // P4-250: Tq or Ta above 3 is refused, though neither selects
+        // anything in a lossless frame and libjpeg ignores both.
+        if layout.max_unused_selector > 3 {
             return;
         }
     }

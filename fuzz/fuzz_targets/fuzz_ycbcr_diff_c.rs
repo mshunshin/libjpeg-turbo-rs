@@ -21,7 +21,11 @@
 //! Skips, with the reason at each `return`: arithmetic-coded streams (the
 //! same open divergence `fuzz_decode_diff_c` skips), 12-bit and lossless
 //! frames (P4-246: those decodes ignore the output colour space), and inputs
-//! either decoder recovered from (their recovery strategies differ).
+//! either decoder recovered from (their recovery strategies differ). A sample
+//! mismatch is excused, unless `LTRS_FUZZ_INCLUDE_KNOWN=1`, when it has a
+//! filed explanation: a scaled decode of coefficients no 8-bit image produces
+//! (the scaled IDCTs saturate by design), or 0xFF fill before a stuffed byte
+//! (P4-248).
 
 #![no_main]
 
@@ -172,6 +176,21 @@ fuzz_target!(|data: &[u8]| {
             }
             assert_eq!(r_px.len(), c_px.len(), "YCbCr output length ({label})");
             if r_px != c_px {
+                if !c_oracle::include_known_gaps() {
+                    // By design: out-of-range coefficients through a scaled
+                    // IDCT (see max_dequantized_coefficient).
+                    let scaled: bool = (scale.num(), scale.denom()) != (1, 1);
+                    if scaled
+                        && c_oracle::max_dequantized_coefficient(jpeg)
+                            .is_some_and(|m| m > c_oracle::MAX_LEGAL_DEQUANTIZED)
+                    {
+                        return;
+                    }
+                    // P4-248: 0xFF fill before a stuffed byte.
+                    if c_oracle::has_fill_before_stuffed_zero(jpeg) {
+                        return;
+                    }
+                }
                 let differing: usize = r_px.iter().zip(c_px).filter(|(a, b)| a != b).count();
                 panic!(
                     "YCbCr output diverges from libjpeg ({label}, {cw}x{ch}): {differing} samples differ; first: {}",
