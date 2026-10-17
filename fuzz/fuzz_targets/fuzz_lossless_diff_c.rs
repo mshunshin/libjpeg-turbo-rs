@@ -119,7 +119,7 @@ fn read_layout(data: &[u8]) -> Option<Layout> {
 }
 
 /// What the C oracle decodes: `data`, with a lone component's sampling
-/// factors set to 1×1.
+/// factors set to 1×1 when they are valid.
 ///
 /// They do not change a one-component scan, which is non-interleaved (T.81
 /// A.2.2), and Rust ignores them. libjpeg does not: for a factor v > 1 it
@@ -130,9 +130,14 @@ fn read_layout(data: &[u8]) -> Option<Layout> {
 /// 3.2.0: a `cjpeg -lossless 1 -restart 2` stream relabelled 1×3 gives 444
 /// of 703 samples wrong, where Rust returns the source. libjpeg's own
 /// encoder never writes such a frame: it forces 1×1 in lossless mode.
+///
+/// Factors outside 1–4 stay as they are: both decoders refuse them
+/// (libjpeg's `JERR_BAD_SAMPLING`, `jdinput.c` `initial_setup`), and the
+/// rewrite would let only libjpeg decode the frame.
 fn oracle_input<'a>(data: &'a [u8], layout: &Layout) -> Cow<'a, [u8]> {
+    let valid = |factor: u8| (1..=4).contains(&factor);
     match layout.lone_sampling_at {
-        Some(at) if data[at] != 0x11 => {
+        Some(at) if data[at] != 0x11 && valid(data[at] >> 4) && valid(data[at] & 0x0F) => {
             let mut patched: Vec<u8> = data.to_vec();
             patched[at] = 0x11;
             Cow::Owned(patched)
