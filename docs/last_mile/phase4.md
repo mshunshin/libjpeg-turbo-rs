@@ -14094,3 +14094,38 @@ produces libjpeg's output for that `out_color_space` (`jpeg12_*` for 12-bit,
 compared against a 12-bit-capable oracle) or is refused with `Unsupported`;
 never silently ignored. The `set_output_colorspace` rustdoc drops its
 "12-bit and lossless frames ignore this" caveat.
+
+## P4-247. Lossless Decode Diverges From libjpeg on Restart Intervals, Subsampled Frames and Multi-Scan Frames — **OPEN**
+
+Found by the mycardium-deid-pixels team (their report
+`docs/reports/2026-10-16-libjpeg-turbo-rs-upstream-bugs/`) and confirmed with
+`fuzz/fuzz_targets/fuzz_lossless_diff_c.rs`, which compares
+`precision::decompress_lossless_arbitrary` with libjpeg-turbo 3.2.0 through
+`examples/lossless_decode_c_oracle.c`. All three are legal T.81 lossless
+layouts that libjpeg decodes to the source:
+
+1. **Restart intervals are ignored.** The decoder reads the DRI interval but
+   never resets prediction at each interval (T.81 H.1.2.1; C:
+   `jddiffct.c` `restart_rows_to_go` / `process_restart`). `cjpeg -lossless 1
+   -restart 1` on a 61×45 RGB image decodes with 8024 of 8235 samples wrong,
+   and returns `Ok`.
+2. **Subsampled multi-component frames decode wrong.** Interleaved SOF3
+   frames with luma sampled 2×1, 2×2 or 1×2 against 1×1 chroma return `Ok`
+   with 380–383 of 384 samples wrong on a 16×8 image (C upsamples; even the
+   stored samples Rust returns are not the coded ones).
+3. **A first scan that codes fewer components than the frame is refused.**
+   C decodes the components across their later scans; P4-75 turned this
+   entry point's panic into `CorruptData` ("all 3 must be present in a
+   single interleaved scan"), so it is safe but still unsupported.
+
+`cjpeg` cannot write 2 or 3 (it ignores `-sample` in lossless mode), so the
+seeds `fuzz/corpus/fuzz_lossless_diff_c/diffseed_lossless_synthetic_*.jpg`
+come from the small T.81 encoder in
+`fuzz/scripts/make_c_oracle_diff_seeds.py`. The differential target skips
+all three unless `LTRS_FUZZ_INCLUDE_KNOWN=1`.
+
+Acceptance: `fuzz_lossless_diff_c` with `LTRS_FUZZ_INCLUDE_KNOWN=1` passes
+over its seeds — restart and subsampled frames byte-identical to libjpeg,
+multi-scan frames decoded or (as a documented decision) refused — and the
+corresponding skips are removed from the target.
+

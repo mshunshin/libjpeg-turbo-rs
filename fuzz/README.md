@@ -61,6 +61,31 @@ cargo +nightly fuzz run fuzz_decompress -- -dict=fuzz/jpeg.dict -max_total_time=
 | `fuzz_decode_diff_c` | Differential decode against a subprocess `djpeg` (P2-7) | 330 |
 | `fuzz_encode_diff_c` | Differential encode round-trip against subprocess `cjpeg`/`djpeg` (P2-7) | 299 |
 | `fuzz_transform_diff_c` | Differential transform against a subprocess `jpegtran` (P2-7) | 10 |
+| `fuzz_ycbcr_diff_c` | YCbCr output (`set_output_colorspace(YCbCr)`) at every scale, box/fancy upsampling and crops, byte-exact against libjpeg's `JCS_YCbCr` (P4-244) | 198 |
+| `fuzz_raw_diff_c` | `Decoder::decode_raw` component planes, byte-exact against `jpeg_read_raw_data` | 36 |
+| `fuzz_lossless_diff_c` | `precision::decompress_lossless_arbitrary` at precision 2–16, byte-exact against libjpeg's lossless decoder (P4-247) | 21 |
+
+### Targets with C oracle programs
+
+`fuzz_ycbcr_diff_c`, `fuzz_raw_diff_c` and `fuzz_lossless_diff_c` compare
+against libjpeg calls no command-line tool exposes, through small programs in
+`examples/*_c_oracle.c`. Build them against a libjpeg-turbo 3.x development
+install (headers and library; the lossless oracle needs the 12- and 16-bit
+API), export the paths the script prints, then run as usual:
+
+```bash
+eval "$(fuzz/build_c_oracles.sh /opt/homebrew/opt/jpeg-turbo)"
+cargo +nightly fuzz run fuzz_lossless_diff_c -- -dict=fuzz/jpeg.dict -max_total_time=600
+```
+
+Without its oracle such a target exits with an error rather than comparing
+nothing. Each asserts only on inputs libjpeg decodes without a warning, and
+skips divergences already filed (each skip names its LAST_MILE item);
+`LTRS_FUZZ_INCLUDE_KNOWN=1` turns those skips off, to confirm the target still
+finds them or that a fix closed them. Their seeds come from
+`fuzz/scripts/make_c_oracle_diff_seeds.py <cjpeg 3.x>`, which includes a small
+T.81 lossless encoder for layouts `cjpeg` cannot write; the
+`diffseed_lossless_*` files it writes into `fuzz_decompress_precision/` too.
 
 ## Run
 
