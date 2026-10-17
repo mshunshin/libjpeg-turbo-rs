@@ -14218,3 +14218,41 @@ Acceptance: SOF3/SOF11 frames accept any Tq and Ta, or the refusal is a
 documented decision.
 
 In this fork: reproducers `fuzz/known_divergences/fuzz_lossless_diff_c/p4_250_lossless_{tq,ta}_out_of_range.jpg`; `fuzz_lossless_diff_c` skips such frames unless `LTRS_FUZZ_INCLUDE_KNOWN=1`.
+
+## P4-251. 12-Bit Decoders Count MCUs in a `u16`: Debug Panic at 65,536 MCUs, Misplaced Restarts in Release — **CLOSED 2026-10-17**
+
+`precision::decompress_12bit` and `raw_data_12::decompress_raw_12` keep their
+MCU counter in a `u16` (`src/api/precision.rs:1041`,
+`src/api/raw_data_12.rs:326`), where every other decoder's counter is `u32`.
+A frame of more than 65,535 MCUs — a 2048×2048 12-bit greyscale image is the
+first square size — overflows it:
+
+- **Debug builds panic** ("attempt to add with overflow",
+  `precision.rs:1097`, `raw_data_12.rs:380`) on every such frame, with or
+  without restart markers. Through `catch_unwind` this surfaces as a
+  `DecoderPanic` for native callers; elsewhere it aborts the decode.
+- **Release builds wrap.** That is harmless without restarts, but the
+  restart check `mcu_count.is_multiple_of(restart_interval)` then runs on the
+  wrapped count, so once a frame passes 65,536 MCUs its restarts land in the
+  wrong place unless the interval divides 65,536. Both functions return `Ok`.
+
+Measured at `main` 25d6605c against `djpeg` (libjpeg-turbo 3.2.0), on
+`cjpeg -precision 12 -quality 95` greyscale images:
+
+| Frame | debug | release |
+|---|---|---|
+| 2048×2048 (65,536 MCUs) | panic | identical |
+| 2048×2048, `-restart 1` (256 MCUs, divides 65,536) | panic | identical |
+| 2056×2056 (66,049 MCUs) | panic | identical |
+| 2056×2056, `-restart 1` (257 MCUs) | panic | 16,448 of 4,227,136 samples differ — one MCU row |
+
+Acceptance: both counters `u32` like the rest of the decoders, and a
+regression test decoding a 2056×2056 12-bit frame with a 257-MCU restart
+interval byte-identical to `djpeg` in a debug build.
+
+**Status (2026-10-17): closed.** Both counters are `u32`, the restart check
+compares against `u32::from(restart_interval)`. `cargo test --test
+twelve_bit_mcu_counter` decodes the 2056×2056 frame (66,049 MCUs, one
+restart per 257-MCU row) through `decompress_12bit` and `decompress_raw_12`
+identically to `djpeg` (libjpeg-turbo 3.2.0) in debug and release builds;
+before the fix it panicked in debug and differed on 16,448 samples in release.
