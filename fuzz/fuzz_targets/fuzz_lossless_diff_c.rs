@@ -13,12 +13,11 @@
 //! 3. every sample is identical — lossless decoding has no tolerance.
 //!
 //! Known divergences are skipped unless `LTRS_FUZZ_INCLUDE_KNOWN=1`:
-//! - P4-247: a restart interval (prediction is not reset per interval, so
-//!   samples after the first interval are wrong, with `Ok`); a multi-component
-//!   frame with any sampling factor other than 1×1 (wrong samples, `Ok`); and
-//!   a first scan coding fewer components than the frame, which libjpeg
-//!   decodes across its later scans and this entry point refuses (P4-75 made
-//!   that a `CorruptData` refusal; 0.8.0 panicked).
+//! - P4-247: a multi-component frame with any sampling factor other than
+//!   1×1 (wrong samples, `Ok`), and a first scan coding fewer components than
+//!   the frame, which libjpeg decodes across its later scans and this entry
+//!   point refuses (P4-75 made that a `CorruptData` refusal; 0.8.0 panicked).
+//!   Restart intervals, its part 1, are compared: they are fixed.
 //! - P4-250: a frame-header Tq or first-scan Ta above 3, which libjpeg
 //!   ignores in lossless mode and Rust refuses.
 //! - P4-66: below 16 bits, where libjpeg carries a corrupt difference's sum
@@ -51,7 +50,6 @@ struct Layout {
     first_scan_components: Option<u8>,
     /// The largest Tq in the frame header and Ta in the first scan header.
     max_unused_selector: u8,
-    restart_interval: bool,
 }
 
 /// Walk the marker segments up to the first SOS. Returns `None` unless the
@@ -62,7 +60,6 @@ fn read_layout(data: &[u8]) -> Option<Layout> {
     }
     let mut i: usize = 2;
     let mut layout: Option<Layout> = None;
-    let mut restart_interval: bool = false;
     while i + 4 <= data.len() {
         if data[i] != 0xFF {
             return None;
@@ -89,14 +86,12 @@ fn read_layout(data: &[u8]) -> Option<Layout> {
                         .filter_map(|k| segment.get(8 + 3 * k).copied())
                         .max()
                         .unwrap_or(0),
-                    restart_interval: false,
                 });
             }
             // A DCT or arithmetic frame before any SOF3: not this decoder's.
             0xC0..=0xCF if marker != 0xC4 && marker != 0xC8 && marker != 0xCC => {
                 layout.as_ref()?;
             }
-            0xDD => restart_interval |= segment.get(..2)? != [0, 0],
             0xDA => {
                 let mut layout: Layout = layout?;
                 layout.first_scan_components = segment.first().copied();
@@ -106,13 +101,6 @@ fn read_layout(data: &[u8]) -> Option<Layout> {
                     .chain([layout.max_unused_selector])
                     .max()
                     .unwrap_or(0);
-                // A DRI may also follow the first scan; any non-zero one in the
-                // rest of the stream counts. (0xFF 0xDD cannot occur in valid
-                // entropy-coded data.)
-                restart_interval |= data[i..].windows(6).any(|w| {
-                    w[0] == 0xFF && w[1] == 0xDD && w[2..4] == [0, 4] && w[4..6] != [0, 0]
-                });
-                layout.restart_interval = restart_interval;
                 return Some(layout);
             }
             _ => {}
@@ -138,10 +126,6 @@ fuzz_target!(|data: &[u8]| {
         return;
     }
     if !c_oracle::include_known_gaps() {
-        // P4-247 (1): restart intervals are ignored.
-        if layout.restart_interval {
-            return;
-        }
         // P4-247 (3): a first scan coding fewer components than the frame is
         // refused (P4-75), where libjpeg decodes the later scans too.
         if layout.first_scan_components != Some(layout.sampling.len() as u8) {
