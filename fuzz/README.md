@@ -50,7 +50,7 @@ cargo +nightly fuzz run fuzz_decompress -- -dict=fuzz/jpeg.dict -max_total_time=
 |--------|-------------|-------------|
 | `fuzz_decompress` | Main decoder — highest priority target | ~347 |
 | `fuzz_decompress_lenient` | Lenient-mode decoder (tolerates partial corruption) | ~347 |
-| `fuzz_decompress_precision` | 12/16-bit and arbitrary-precision decode entry points (`api/precision.rs`) | 3 |
+| `fuzz_decompress_precision` | 12/16-bit and arbitrary-precision decode entry points (`api/precision.rs`) | 353 |
 | `fuzz_roundtrip` | Compress then decompress — checks encoder/decoder consistency | ~320 |
 | `fuzz_read_coefficients` | DCT coefficient reader | ~347 |
 | `fuzz_transform` | Read coefficients then write them back | ~331 |
@@ -63,7 +63,7 @@ cargo +nightly fuzz run fuzz_decompress -- -dict=fuzz/jpeg.dict -max_total_time=
 | `fuzz_transform_diff_c` | Differential transform against a subprocess `jpegtran` (P2-7) | 10 |
 | `fuzz_ycbcr_diff_c` | YCbCr output (`set_output_colorspace(YCbCr)`) at every scale, box/fancy upsampling and crops, byte-exact against libjpeg's `JCS_YCbCr` (P4-244) | 198 |
 | `fuzz_raw_diff_c` | `Decoder::decode_raw` component planes, byte-exact against `jpeg_read_raw_data` | 36 |
-| `fuzz_lossless_diff_c` | `precision::decompress_lossless_arbitrary` at precision 2–16, byte-exact against libjpeg's lossless decoder (P4-247) | 21 |
+| `fuzz_lossless_diff_c` | `precision::decompress_lossless_arbitrary` at precision 2–16, byte-exact against libjpeg's lossless decoder (P4-247) | 25 |
 
 ### Targets with C oracle programs
 
@@ -89,7 +89,11 @@ saturate by design), 0xFF fill before a stuffed byte (P4-248), raw output that
 equals libjpeg's with smoothing off (P4-249), lossless Tq/Ta above 3 (P4-250).
 P4-66 cannot be excused reliably — its effect spreads through later
 predictions — so lossless findings below 16 bits need replaying against a
-build that wraps modulo 2^16.
+build that wraps modulo 2^16. The lossless target also hands libjpeg a
+one-component frame's sampling factors as 1×1, which T.81 makes equivalent:
+for a 1×v component libjpeg applies a restart's prediction reset at the
+start of the v-row iMCU row, so an interval that is not a multiple of v rows
+decodes wrong in libjpeg-turbo 3.2.0 and right in Rust.
 
 `fuzz/known_divergences/<target>/` keeps one input per class, outside the
 corpora so a run does not stop on them: replay with

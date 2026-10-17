@@ -22,12 +22,17 @@
 //!   ignores in lossless mode and Rust refuses.
 //! - P4-66: below 16 bits, where libjpeg carries a corrupt difference's sum
 //!   modulo 2^16 and Rust masks it to the precision.
+//!
+//! libjpeg is handed a lone component's sampling factors as 1×1 (see
+//! [`oracle_input`]); a libjpeg bug would otherwise fail restart streams that
+//! Rust decodes correctly.
 
 #![no_main]
 
 #[path = "common/c_oracle.rs"]
 mod c_oracle;
 
+use std::borrow::Cow;
 use std::path::PathBuf;
 use std::sync::OnceLock;
 
@@ -50,6 +55,8 @@ struct Layout {
     first_scan_components: Option<u8>,
     /// The largest Tq in the frame header and Ta in the first scan header.
     max_unused_selector: u8,
+    /// Offset of the sampling-factor byte of a one-component frame.
+    lone_sampling_at: Option<usize>,
 }
 
 /// Walk the marker segments up to the first SOS. Returns `None` unless the
@@ -86,6 +93,7 @@ fn read_layout(data: &[u8]) -> Option<Layout> {
                         .filter_map(|k| segment.get(8 + 3 * k).copied())
                         .max()
                         .unwrap_or(0),
+                    lone_sampling_at: (components == 1).then_some(i + 4 + 7),
                 });
             }
             // A DCT or arithmetic frame before any SOF3: not this decoder's.
@@ -108,6 +116,29 @@ fn read_layout(data: &[u8]) -> Option<Layout> {
         i += 2 + length;
     }
     None
+}
+
+/// What the C oracle decodes: `data`, with a lone component's sampling
+/// factors set to 1×1.
+///
+/// They do not change a one-component scan, which is non-interleaved (T.81
+/// A.2.2), and Rust ignores them. libjpeg does not: for a factor v > 1 it
+/// decodes v rows per iMCU row and only then undifferences them
+/// (`jddiffct.c` `decompress_data`), so a restart's prediction reset lands
+/// on the iMCU row's first row. Any restart interval that is not a multiple
+/// of v rows then decodes wrong — checked 2026-10-17 with libjpeg-turbo
+/// 3.2.0: a `cjpeg -lossless 1 -restart 2` stream relabelled 1×3 gives 444
+/// of 703 samples wrong, where Rust returns the source. libjpeg's own
+/// encoder never writes such a frame: it forces 1×1 in lossless mode.
+fn oracle_input<'a>(data: &'a [u8], layout: &Layout) -> Cow<'a, [u8]> {
+    match layout.lone_sampling_at {
+        Some(at) if data[at] != 0x11 => {
+            let mut patched: Vec<u8> = data.to_vec();
+            patched[at] = 0x11;
+            Cow::Owned(patched)
+        }
+        _ => Cow::Borrowed(data),
+    }
 }
 
 fuzz_target!(|data: &[u8]| {
@@ -142,7 +173,11 @@ fuzz_target!(|data: &[u8]| {
         }
     }
 
-    let c_result = c_oracle::run_oracle(oracle, &["/dev/stdin".to_string()], data);
+    let c_result = c_oracle::run_oracle(
+        oracle,
+        &["/dev/stdin".to_string()],
+        &oracle_input(data, &layout),
+    );
     let rust_result = decompress_lossless_arbitrary(data);
 
     let c = match c_result {

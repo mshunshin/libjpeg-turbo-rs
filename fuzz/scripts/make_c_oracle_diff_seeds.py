@@ -9,9 +9,11 @@ Writes, under the corpus dir (default fuzz/corpus):
 - fuzz_ycbcr_diff_c/     the colour ones, each behind a few option prefixes
                          (scale, box/fancy upsampling, crop; see the target)
 - fuzz_lossless_diff_c/  SOF3 streams: every predictor, a point transform,
-  and fuzz_decompress_precision/  precisions 2/8/12/16, a restart interval,
-                         plus layouts cjpeg cannot write (non-interleaved
-                         scans, subsampled frames), from the encoder below
+  and fuzz_decompress_precision/  precisions 2/8/12/16, restart intervals
+                         (one relabelled 1x3, which libjpeg mis-decodes; the
+                         lossless target hands it libjpeg as 1x1), plus
+                         layouts cjpeg cannot write (non-interleaved scans,
+                         subsampled frames), from the encoder below
 
 Every stream is a legal JPEG that libjpeg-turbo 3.2.0 decodes. Re-running
 overwrites the same file names.
@@ -218,6 +220,17 @@ def main():
     lossless["grey_p12_psv1"] = cjpeg(tool, pnm(1, 4095), ["-lossless", "1", "-precision", "12"])
     lossless["rgb_p12_psv7_pt3"] = cjpeg(tool, pnm(3, 4095), ["-lossless", "7,3", "-precision", "12"])
     lossless["grey_p16_psv4"] = cjpeg(tool, pnm(1, 65535), ["-lossless", "4", "-precision", "16"])
+    lossless["grey_p2_psv1_restart2"] = cjpeg(
+        tool, pnm(1, 3), ["-lossless", "1", "-precision", "2", "-restart", "2"])
+    lossless["grey_p12_psv7_restart1"] = cjpeg(
+        tool, pnm(1, 4095), ["-lossless", "7", "-precision", "12", "-restart", "1"])
+    lossless["rgb_p16_psv4_restart3"] = cjpeg(
+        tool, pnm(3, 65535), ["-lossless", "4", "-precision", "16", "-restart", "3"])
+    # The lone component relabelled 1x3 (T.81 leaves a one-component scan
+    # unchanged); a 2-row interval is not a multiple of 3.
+    relabelled = bytearray(cjpeg(tool, grey, ["-lossless", "1", "-restart", "2"]))
+    relabelled[relabelled.index(b"\xff\xc3") + 4 + 7] = 0x13
+    lossless["grey_p8_psv1_restart2_sampling13"] = bytes(relabelled)
     for seed, (name, (sampling, scans)) in enumerate(SYNTHETIC_LOSSLESS.items()):
         lossless[f"synthetic_{name}"] = p14(16, 8, sampling, scans, seed)
     for name, jpeg in lossless.items():
