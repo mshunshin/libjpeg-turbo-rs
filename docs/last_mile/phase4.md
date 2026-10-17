@@ -1372,7 +1372,7 @@ C expands instead of ignoring: `djpeg -rgb` on a `cjpeg -precision 12` grayscale
 
 **Acceptance criteria.** `undifference_row_16` wraps modulo 0xFFFF like C, with the sample-type truncation left to the output upscale stage (mirroring the P4-38 fix); a crafted wrapping 12-bit lossless fixture cross-validated against `djpeg` (3.x decodes 12-bit lossless); a note in the fix on whether the 12-as-8 route (`decode_12bit_as_8bit`, P4-65) shares the defect.
 
-**Progress (2026-10-17).** Not 12-bit only: `decompress_lossless_arbitrary` masks every precision below 16 the same way, and `fuzz_lossless_diff_c` hit it on 8-bit frames (11 findings in a one-hour 20-core campaign). Because the masked sample predicts its neighbours, one wrapped sum changes later samples too, so the divergence spreads along the row and into later rows rather than staying where a mask comparison would find it. An experimental build that wraps at 0xFFFF and masks only at output matched libjpeg byte for byte on all 11. Reproducer: `fuzz/known_divergences/fuzz_lossless_diff_c/p4_66_lossless_wrap_8bit.jpg`.
+**Progress (2026-10-17).** Not 12-bit only: `decompress_lossless_arbitrary` masks every precision below 16 the same way, and differential fuzzing against libjpeg-turbo 3.2.0 hit it on 8-bit frames (11 findings in one hour on 20 cores). Because the masked sample predicts its neighbours, one wrapped sum changes later samples too, so the divergence spreads along the row and into later rows. An experimental build that wraps at 0xFFFF and masks only at output matched libjpeg byte for byte on all 11. In this fork: reproducer `fuzz/known_divergences/fuzz_lossless_diff_c/p4_66_lossless_wrap_8bit.jpg`.
 
 ## P4-67. `apply_orientation` Strided Reads Are Cache-Hostile for Orientations 5-8 — **OPEN**
 
@@ -14099,103 +14099,122 @@ never silently ignored. The `set_output_colorspace` rustdoc drops its
 
 ## P4-247. Lossless Decode Diverges From libjpeg on Restart Intervals, Subsampled Frames and Multi-Scan Frames — **OPEN**
 
-Found by the mycardium-deid-pixels team (their report
-`docs/reports/2026-10-16-libjpeg-turbo-rs-upstream-bugs/`) and confirmed with
-`fuzz/fuzz_targets/fuzz_lossless_diff_c.rs`, which compares
-`precision::decompress_lossless_arbitrary` with libjpeg-turbo 3.2.0 through
-`examples/lossless_decode_c_oracle.c`. All three are legal T.81 lossless
-layouts that libjpeg decodes to the source:
+Found by differential testing of `precision::decompress_lossless_arbitrary`
+against libjpeg-turbo 3.2.0 (libjpeg asked for `out_color_space =
+jpeg_color_space`, read through the 8-, 12- or 16-bit API by precision). All
+three are legal T.81 lossless layouts that libjpeg decodes to the source:
 
-1. **Restart intervals are ignored.** The decoder reads the DRI interval but
-   never resets prediction at each interval (T.81 H.1.2.1; C:
-   `jddiffct.c` `restart_rows_to_go` / `process_restart`). `cjpeg -lossless 1
-   -restart 1` on a 61×45 RGB image decodes with 8024 of 8235 samples wrong,
-   and returns `Ok`.
-2. **Subsampled multi-component frames decode wrong.** Interleaved SOF3
-   frames with luma sampled 2×1, 2×2 or 1×2 against 1×1 chroma return `Ok`
-   with 380–383 of 384 samples wrong on a 16×8 image (C upsamples; even the
-   stored samples Rust returns are not the coded ones).
+1. **Restart intervals are ignored.** The DRI interval is read, but
+   prediction is not reset at each interval (T.81 H.1.2.1; C: `jddiffct.c`
+   `restart_rows_to_go` / `process_restart`). `cjpeg -lossless 1 -restart 1`
+   on a 33×17 greyscale image decodes with 527 of 561 samples different from
+   `djpeg`, and returns `Ok`; without `-restart` all 561 match.
+2. **Subsampled multi-component frames decode wrong.** An interleaved SOF3
+   frame with luma sampled 2×1, 2×2 or 1×2 against 1×1 chroma returns `Ok`
+   with 380–383 of 384 samples wrong on a 16×8 image (C decodes the stored
+   samples and upsamples them).
 3. **A first scan that codes fewer components than the frame is refused.**
    C decodes the components across their later scans; P4-75 turned this
    entry point's panic into `CorruptData` ("all 3 must be present in a
-   single interleaved scan"), so it is safe but still unsupported.
+   single interleaved scan"), so it is safe but unsupported.
 
-`cjpeg` cannot write 2 or 3 (it ignores `-sample` in lossless mode), so the
-seeds `fuzz/corpus/fuzz_lossless_diff_c/diffseed_lossless_synthetic_*.jpg`
-come from the small T.81 encoder in
-`fuzz/scripts/make_c_oracle_diff_seeds.py`. The differential target skips
-all three unless `LTRS_FUZZ_INCLUDE_KNOWN=1`.
+`cjpeg` cannot write 2 or 3 (it ignores `-sample` in lossless mode); a
+minimal T.81 Process-14 encoder for them is
+`fuzz/scripts/make_c_oracle_diff_seeds.py` in mshunshin/libjpeg-turbo-rs
+(branch `mycardium`).
 
-Acceptance: `fuzz_lossless_diff_c` with `LTRS_FUZZ_INCLUDE_KNOWN=1` passes
-over its seeds — restart and subsampled frames byte-identical to libjpeg,
-multi-scan frames decoded or (as a documented decision) refused — and the
-corresponding skips are removed from the target.
+Acceptance: restart and subsampled frames byte-identical to libjpeg;
+multi-scan frames decoded, or refused as a documented decision.
+
+In this fork, `fuzz_lossless_diff_c` (seeds `fuzz/corpus/fuzz_lossless_diff_c/diffseed_lossless_synthetic_*.jpg`) skips all three unless `LTRS_FUZZ_INCLUDE_KNOWN=1`; drop the skips when this closes.
 
 ## P4-248. A 0xFF Fill Byte Before a Stuffed Byte Mis-Decodes Baseline 4:4:4, 4:2:2 and 4:1:1 Silently — **OPEN**
 
-Found by `fuzz_ycbcr_diff_c` on 2026-10-17. In entropy-coded data a run of
+Found by differential fuzzing on 2026-10-17. In entropy-coded data a run of
 0xFF bytes followed by 0x00 — fill before a stuffed byte — is read by libjpeg
 as one stuffed 0xFF (`jdhuff.c` `jpeg_fill_bit_buffer` skips the extra 0xFF),
 without a warning. P4-242 (#678) added that recovery, and
 `tests/marker_stray_bytes.rs::entropy_fill_before_stuffed_byte_is_warning_free`
-pins it, but only on a progressive 4:2:0 stream. The same recipe — the test's
-own 128×128 noise image, one extra 0xFF before the first `FF 00` in the scan
-— on a **baseline** stream gives:
+pins it, but only on a progressive 4:2:0 stream. The test's own recipe — the
+128×128 xorshift noise image, `cjpeg -quality 95`, one extra 0xFF inserted
+before the first `FF 00` after SOS — on **baseline** streams gives, against
+`djpeg -strict` (libjpeg-turbo 3.2.0) at `main` 25d6605c:
 
 | `cjpeg -sample` | baseline | progressive |
 |---|---|---|
 | `2x2` (4:2:0) | identical | identical |
-| `1x1` (4:4:4) | 151 of 49152 bytes differ | identical |
-| `2x1` (4:2:2) | 151 differ | identical |
-| `4x1` (4:1:1) | 149 differ | identical |
+| `1x1` (4:4:4) | 151 of 49152 bytes differ (max 5) | identical |
+| `2x1` (4:2:2) | 151 differ (max 5) | identical |
+| `4x1` (4:1:1) | 149 differ (max 5) | identical |
 | `1x2` (4:4:0) | identical | identical |
 
-`djpeg -strict` accepts every one (exit 0); `Decoder` strict and lenient
-return `Ok` with no warning. On the fuzzer's 61×45 4:4:0 input the fill run
-was 64 bytes long and `read_coefficients` returned 0 where libjpeg (via
-`jpegtran -copy none`) has −1 for most AC coefficients of two blocks; any run
-of two or more 0xFF diverged, a lone `FF 00` did not. The baseline Huffman
-path for these layouts does not skip fill the way the progressive path does.
-Reproducer: `fuzz/known_divergences/fuzz_ycbcr_diff_c/p4_248_fill_before_stuffed_byte.bin`
-(3-byte option prefix, then the JPEG).
+`djpeg -strict` exits 0 for every one; `Decoder` returns `Ok` with no warning
+in strict and lenient mode. On a fuzzed 61×45 4:4:0 stream with a 64-byte fill
+run, `read_coefficients` returned 0 where libjpeg (via `jpegtran -copy none`)
+holds −1 for most AC coefficients of two blocks, and the pixels differed by up
+to 41; any run of two or more 0xFF diverged, a lone `FF 00` did not. The
+baseline Huffman path for these layouts does not skip fill the way the
+progressive path does.
 
 Acceptance: the P4-242 test extended to baseline streams of every standard
-sampling layout, byte-identical to `djpeg -strict`; the C-oracle targets'
-P4-248 skip removed.
+sampling layout, byte-identical to `djpeg -strict`.
 
-## P4-249. `decode_raw` Skips Block Smoothing That libjpeg's Raw Output Applies — **OPEN**
+In this fork: reproducer `fuzz/known_divergences/fuzz_ycbcr_diff_c/p4_248_fill_before_stuffed_byte.bin` (3-byte option prefix, then the JPEG); the C-oracle targets excuse it unless `LTRS_FUZZ_INCLUDE_KNOWN=1`.
 
-Found by `fuzz_raw_diff_c` on 2026-10-17 (13 of 13 raw findings in a one-hour
-20-core campaign). `Decoder::decode_raw` documents itself as libjpeg's
-`jpeg_read_raw_data()`, but passes `block_smoothing = false` to the
-progressive plane decoder (`src/decode/pipeline_impl/raw.rs`, "raw data
-decode: no block smoothing"). libjpeg's default `do_block_smoothing = TRUE`
-applies to raw output too: for a progressive stream whose scans stop before
-the last bit of some coefficients (Al > 0 left, or AC bands never sent), the
-coefficient controller smooths, and the raw planes differ from Rust's by a
-few levels across whole blocks. `examples/raw_decode_c_oracle.c nosmooth`
-(libjpeg with smoothing off) agrees with `decode_raw` on every such input.
-Fully refined progressive streams and all sequential streams are unaffected.
+## P4-249. `decode_raw` Ignores Block Smoothing, Which libjpeg's Raw Output Applies — **OPEN**
 
-Acceptance: either `decode_raw` honours `set_block_smoothing` (default on, as
-libjpeg) and matches `raw_decode_c_oracle` byte for byte, or the rustdoc
-states the deliberate difference; the target's P4-249 excuse removed or kept
-to match. Reproducer: `fuzz/known_divergences/fuzz_raw_diff_c/p4_249_raw_block_smoothing.jpg`.
+Found by differential fuzzing on 2026-10-17. `Decoder::decode_raw` documents
+itself as libjpeg's `jpeg_read_raw_data()`, but passes `block_smoothing =
+false` to the progressive plane decoder unconditionally
+(`src/decode/pipeline_impl/raw.rs`, "raw data decode: no block smoothing"),
+so `set_block_smoothing(true)` has no effect on it. libjpeg's coefficient
+controller smooths raw output too (`do_block_smoothing` is on by default) for
+progressive scans not refined to the last bit. A reproducer: `cjpeg
+-progressive -scans` with the script below on the 128×128 noise image, so
+every coefficient stops at Al = 1:
+
+```
+0,1,2: 0-0, 0, 1;
+0: 1-63, 0, 1;
+1: 1-63, 0, 1;
+2: 1-63, 0, 1;
+```
+
+Against libjpeg with `raw_data_out = TRUE` (default smoothing), `decode_raw`
+differs on 2474 of the 4:2:0 planes' samples and 6363 of the 4:4:4 planes';
+against libjpeg with `do_block_smoothing = FALSE` it is identical. `djpeg`
+emits no warning.
+
+Related, perhaps deliberate but undocumented: `Decoder` defaults
+`block_smoothing` to off (`api.rs`), where libjpeg defaults it on, so
+`decode_image` of the same streams differs from `djpeg` by 10,329 (4:4:4) and
+10,907 (4:2:0) bytes until `set_block_smoothing(true)` — then it is
+identical.
+`fuzz_decode_diff_c` already turns smoothing on for that reason.
+
+Acceptance: `decode_raw` honours `set_block_smoothing` and, with it on,
+matches `jpeg_read_raw_data` byte for byte; the default (and its rustdoc)
+decided and stated.
+
+In this fork: reproducer `fuzz/known_divergences/fuzz_raw_diff_c/p4_249_raw_block_smoothing.jpg`; `fuzz_raw_diff_c` excuses a mismatch that `raw_decode_c_oracle nosmooth` explains, unless `LTRS_FUZZ_INCLUDE_KNOWN=1`.
 
 ## P4-250. Lossless Decode Refuses Tq or Ta Above 3, Which libjpeg Ignores — **OPEN**
 
-Found by `fuzz_lossless_diff_c` on 2026-10-17 (12 findings). A lossless frame
-uses neither the SOF quantization table selector Tq nor the SOS AC table
-selector Ta; T.81 Tables B.2 and B.3 give both as 0 for lossless, and libjpeg
-neither checks nor uses them in lossless mode. The shared header parser
-(`src/decode/marker.rs`, "quantization table index … out of range (0-3)" and
-"Huffman table index out of range") range-checks them for every frame type,
-so a lossless frame with Tq or Ta of 4 or more is refused as `CorruptData`
-where libjpeg decodes it. Real encoders seen so far write 0–2 (GE Vingmed:
-Tq = 1–2, with Se = 63, which this decoder already ignores and libjpeg
-refuses). Reproducers:
-`fuzz/known_divergences/fuzz_lossless_diff_c/p4_250_lossless_{tq,ta}_out_of_range.jpg`.
+Found by differential fuzzing on 2026-10-17. A lossless frame uses neither the
+SOF quantization table selector Tq nor the SOS AC table selector Ta; T.81
+Tables B.2 and B.3 give both as 0 for lossless, and libjpeg neither checks
+nor uses them in lossless mode (`jdinput.c:299-300` skips
+`latch_quant_tables` for lossless; only DC tables are bound). The shared header parser (`src/decode/marker.rs`,
+"quantization table index … out of range (0-3)" and "Huffman table index out
+of range") range-checks them for every frame type, so a lossless frame with
+Tq or Ta of 4 or more is refused as `CorruptData` by both
+`precision::decompress_lossless_arbitrary` and `Decoder::decode_image`.
+Reproducer: `cjpeg -lossless 1` on any greyscale or RGB image, then set every
+component's Tq (or Ta) to 4 — `djpeg` decodes it with no warning. Encoders seen
+in practice write 0–2 (GE Vingmed ultrasound: Tq = 1–2, with Se = 63, which
+this decoder ignores and libjpeg refuses).
 
-Acceptance: SOF3/SOF11 frames accept any Tq and Ta (or the refusal is a
-documented decision); the target's P4-250 skip removed.
+Acceptance: SOF3/SOF11 frames accept any Tq and Ta, or the refusal is a
+documented decision.
 
+In this fork: reproducers `fuzz/known_divergences/fuzz_lossless_diff_c/p4_250_lossless_{tq,ta}_out_of_range.jpg`; `fuzz_lossless_diff_c` skips such frames unless `LTRS_FUZZ_INCLUDE_KNOWN=1`.
