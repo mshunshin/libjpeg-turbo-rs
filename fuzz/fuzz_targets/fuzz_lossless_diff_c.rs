@@ -13,22 +13,26 @@
 //! 3. every sample is identical — lossless decoding has no tolerance.
 //!
 //! Known divergences are skipped unless `LTRS_FUZZ_INCLUDE_KNOWN=1`:
-//! - P4-247: a restart interval (prediction is not reset per interval, so
-//!   samples after the first interval are wrong, with `Ok`); a multi-component
-//!   frame with any sampling factor other than 1×1 (wrong samples, `Ok`); and
-//!   a first scan coding fewer components than the frame, which libjpeg
-//!   decodes across its later scans and this entry point refuses (P4-75 made
-//!   that a `CorruptData` refusal; 0.8.0 panicked).
+//! - P4-247: a multi-component frame with any sampling factor other than
+//!   1×1 (wrong samples, `Ok`), and a first scan coding fewer components than
+//!   the frame, which libjpeg decodes across its later scans and this entry
+//!   point refuses (P4-75 made that a `CorruptData` refusal; 0.8.0 panicked).
+//!   Restart intervals, its part 1, are compared: they are fixed.
 //! - P4-250: a frame-header Tq or first-scan Ta above 3, which libjpeg
 //!   ignores in lossless mode and Rust refuses.
 //! - P4-66: below 16 bits, where libjpeg carries a corrupt difference's sum
 //!   modulo 2^16 and Rust masks it to the precision.
+//!
+//! libjpeg is handed a lone component's sampling factors as 1×1 (see
+//! [`oracle_input`]); a libjpeg bug would otherwise fail restart streams that
+//! Rust decodes correctly.
 
 #![no_main]
 
 #[path = "common/c_oracle.rs"]
 mod c_oracle;
 
+use std::borrow::Cow;
 use std::path::PathBuf;
 use std::sync::OnceLock;
 
@@ -51,7 +55,8 @@ struct Layout {
     first_scan_components: Option<u8>,
     /// The largest Tq in the frame header and Ta in the first scan header.
     max_unused_selector: u8,
-    restart_interval: bool,
+    /// Offset of the sampling-factor byte of a one-component frame.
+    lone_sampling_at: Option<usize>,
 }
 
 /// Walk the marker segments up to the first SOS. Returns `None` unless the
@@ -62,7 +67,6 @@ fn read_layout(data: &[u8]) -> Option<Layout> {
     }
     let mut i: usize = 2;
     let mut layout: Option<Layout> = None;
-    let mut restart_interval: bool = false;
     while i + 4 <= data.len() {
         if data[i] != 0xFF {
             return None;
@@ -89,14 +93,13 @@ fn read_layout(data: &[u8]) -> Option<Layout> {
                         .filter_map(|k| segment.get(8 + 3 * k).copied())
                         .max()
                         .unwrap_or(0),
-                    restart_interval: false,
+                    lone_sampling_at: (components == 1).then_some(i + 4 + 7),
                 });
             }
             // A DCT or arithmetic frame before any SOF3: not this decoder's.
             0xC0..=0xCF if marker != 0xC4 && marker != 0xC8 && marker != 0xCC => {
                 layout.as_ref()?;
             }
-            0xDD => restart_interval |= segment.get(..2)? != [0, 0],
             0xDA => {
                 let mut layout: Layout = layout?;
                 layout.first_scan_components = segment.first().copied();
@@ -106,13 +109,6 @@ fn read_layout(data: &[u8]) -> Option<Layout> {
                     .chain([layout.max_unused_selector])
                     .max()
                     .unwrap_or(0);
-                // A DRI may also follow the first scan; any non-zero one in the
-                // rest of the stream counts. (0xFF 0xDD cannot occur in valid
-                // entropy-coded data.)
-                restart_interval |= data[i..].windows(6).any(|w| {
-                    w[0] == 0xFF && w[1] == 0xDD && w[2..4] == [0, 4] && w[4..6] != [0, 0]
-                });
-                layout.restart_interval = restart_interval;
                 return Some(layout);
             }
             _ => {}
@@ -120,6 +116,29 @@ fn read_layout(data: &[u8]) -> Option<Layout> {
         i += 2 + length;
     }
     None
+}
+
+/// What the C oracle decodes: `data`, with a lone component's sampling
+/// factors set to 1×1.
+///
+/// They do not change a one-component scan, which is non-interleaved (T.81
+/// A.2.2), and Rust ignores them. libjpeg does not: for a factor v > 1 it
+/// decodes v rows per iMCU row and only then undifferences them
+/// (`jddiffct.c` `decompress_data`), so a restart's prediction reset lands
+/// on the iMCU row's first row. Any restart interval that is not a multiple
+/// of v rows then decodes wrong — checked 2026-10-17 with libjpeg-turbo
+/// 3.2.0: a `cjpeg -lossless 1 -restart 2` stream relabelled 1×3 gives 444
+/// of 703 samples wrong, where Rust returns the source. libjpeg's own
+/// encoder never writes such a frame: it forces 1×1 in lossless mode.
+fn oracle_input<'a>(data: &'a [u8], layout: &Layout) -> Cow<'a, [u8]> {
+    match layout.lone_sampling_at {
+        Some(at) if data[at] != 0x11 => {
+            let mut patched: Vec<u8> = data.to_vec();
+            patched[at] = 0x11;
+            Cow::Owned(patched)
+        }
+        _ => Cow::Borrowed(data),
+    }
 }
 
 fuzz_target!(|data: &[u8]| {
@@ -138,10 +157,6 @@ fuzz_target!(|data: &[u8]| {
         return;
     }
     if !c_oracle::include_known_gaps() {
-        // P4-247 (1): restart intervals are ignored.
-        if layout.restart_interval {
-            return;
-        }
         // P4-247 (3): a first scan coding fewer components than the frame is
         // refused (P4-75), where libjpeg decodes the later scans too.
         if layout.first_scan_components != Some(layout.sampling.len() as u8) {
@@ -158,7 +173,11 @@ fuzz_target!(|data: &[u8]| {
         }
     }
 
-    let c_result = c_oracle::run_oracle(oracle, &["/dev/stdin".to_string()], data);
+    let c_result = c_oracle::run_oracle(
+        oracle,
+        &["/dev/stdin".to_string()],
+        &oracle_input(data, &layout),
+    );
     let rust_result = decompress_lossless_arbitrary(data);
 
     let c = match c_result {
