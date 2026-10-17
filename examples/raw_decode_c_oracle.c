@@ -25,6 +25,18 @@
 
 #include "jpeglib.h"
 
+/* libjpeg-turbo builds either the jpeg-6b API (JPEG_LIB_VERSION 62, its
+ * default) or the jpeg-7/8 one, whose scaled DCT sizes are split by axis. */
+#if JPEG_LIB_VERSION >= 70
+#define DCT_H_SIZE(comp) ((comp)->DCT_h_scaled_size)
+#define DCT_V_SIZE(comp) ((comp)->DCT_v_scaled_size)
+#define MIN_DCT_V_SIZE(cinfo) ((cinfo)->min_DCT_v_scaled_size)
+#else
+#define DCT_H_SIZE(comp) ((comp)->DCT_scaled_size)
+#define DCT_V_SIZE(comp) ((comp)->DCT_scaled_size)
+#define MIN_DCT_V_SIZE(cinfo) ((cinfo)->min_DCT_scaled_size)
+#endif
+
 int main(int argc, char **argv)
 {
   struct jpeg_decompress_struct cinfo;
@@ -54,12 +66,12 @@ int main(int argc, char **argv)
   cinfo.raw_data_out = TRUE;
   jpeg_start_decompress(&cinfo);
 
-  lines_per_imcu = (JDIMENSION)(cinfo.max_v_samp_factor * cinfo.min_DCT_v_scaled_size);
+  lines_per_imcu = (JDIMENSION)(cinfo.max_v_samp_factor * MIN_DCT_V_SIZE(&cinfo));
   imcu_rows = (cinfo.output_height + lines_per_imcu - 1) / lines_per_imcu;
   for (ci = 0; ci < cinfo.num_components; ci++) {
     jpeg_component_info *comp = &cinfo.comp_info[ci];
-    rows_per_call[ci] = (JDIMENSION)(comp->v_samp_factor * comp->DCT_v_scaled_size);
-    plane_w[ci] = comp->width_in_blocks * (JDIMENSION)comp->DCT_h_scaled_size;
+    rows_per_call[ci] = (JDIMENSION)(comp->v_samp_factor * DCT_V_SIZE(comp));
+    plane_w[ci] = comp->width_in_blocks * (JDIMENSION)DCT_H_SIZE(comp);
     plane_h[ci] = imcu_rows * rows_per_call[ci];
     rows[ci] = (*cinfo.mem->alloc_sarray)((j_common_ptr)&cinfo, JPOOL_IMAGE,
                                           plane_w[ci], rows_per_call[ci]);
