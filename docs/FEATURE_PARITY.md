@@ -66,6 +66,7 @@
 - [x] TJSAMP_410 (4:1:0; H=4,V=2)
 - [x] TJSAMP_24 (2:4; H=2,V=4)
 - [x] TJSAMP_UNKNOWN (unusual/custom subsampling detection) (`Subsampling::Unknown`)
+- [x] Arbitrary `cjpeg -sample` factors (`Encoder::sampling_factors`) with progressive, arithmetic, restart, optimized Huffman, DCT method and quantisation tables, byte-identical to `cjpeg` (P4-236, #664); custom progressive scripts, smoothing, RGB-direct, four-factor CMYK, grayscale conversion and installed Huffman tables are supported (P4-237, #673); the Rust-only fancy prefilter remains refused; the upstream ARM NEON byte-parity exception is P4-241 (#679)
 
 ---
 
@@ -134,7 +135,7 @@
 
 ### Progressive Scan Control
 - [ ] Full classic `jpeg_simple_progression()` semantics — progressive mode works, but public script installation remains P4-91
-- [ ] Classic `scan_info` / `num_scans` wiring — native `Encoder::scan_script()` is ready for Huffman progressive YCbCr/grayscale and silently ignored on the arithmetic, RGB-direct and custom-sampling paths ([P4-210](last_mile/phase4.md#p4-210-encoderscan_script-is-silently-ignored-outside-the-huffman-ycbcrgrayscale-progressive-path--open), #636); classic scanline wiring remains P4-91
+- [ ] Classic `scan_info` / `num_scans` wiring — native `Encoder::scan_script()` is honoured by every progressive encode (Huffman and arithmetic; YCbCr, grayscale and RGB-direct) and refused with `Unsupported` where no path can follow it ([P4-210](last_mile/phase4.md#p4-210-encoderscan_script-is-silently-ignored-outside-the-huffman-ycbcrgrayscale-progressive-path--closed-2026-10-07), #636); classic scanline wiring remains P4-91
 - [x] `jpeg_scan_info` struct — `ScanScript` struct
 
 ### DCT Method
@@ -214,12 +215,12 @@
 - [x] Lenient / error recovery mode (`decompress_lenient`)
 - [x] `DecodeWarning` list in Image
 - [x] `TJPARAM_STOPONWARNING` — Treat warnings as fatal (`Decoder::set_stop_on_warning()`), including recovered stray marker bytes
-- [x] `TJPARAM_SCANLIMIT` — Max progressive scans before error (`Decoder::set_scan_limit()`, `DecodeLimits::max_scans`); every `TjHandle` decompress entry point and `precision::decompress_{12,16}bit_with_limits` ([P4-199](last_mile/phase4.md#p4-199-setdecompparameters-publishes-thirteen-handle-parameters-our-8-bit-decode-publishes-eight-and-the-1216-bit-ones-publish-three-and-ignore-the-handles-limits--closed-2026-10-07), #620)
+- [x] `TJPARAM_SCANLIMIT` — Max progressive scans before error (`Decoder::set_scan_limit()`, `DecodeLimits::max_scans`); every `TjHandle` decompress entry point, `tj3DecompressToYUV8` / `tj3DecompressToYUVPlanes8` (P4-225) and `tj3Transform` (P4-227, upstream's "Progressive JPEG image has more than N scans"), and `precision::decompress_{12,16}bit_with_limits` ([P4-199](last_mile/phase4.md#p4-199-setdecompparameters-publishes-thirteen-handle-parameters-our-8-bit-decode-publishes-eight-and-the-1216-bit-ones-publish-three-and-ignore-the-handles-limits--closed-2026-10-07), #620)
 - [x] Custom error callbacks — `ErrorHandler` trait
 
 ### Limits
-- [x] `TJPARAM_MAXMEMORY` — Memory limit (`Decoder::set_max_memory()`, `DecodeLimits::max_memory`); the 8-bit `Decoder` path, `precision::decompress_{12,16}bit_with_limits`, and `TjHandle::decompress` / `decompress_12bit` / `decompress_16bit` (not the C ABI's `tj3DecompressToYUV8` / `tj3DecompressToYUVPlanes8`), each against an estimate of its own buffers — docs/STABILITY.md "What the memory budget covers" lists what is and is not counted (P4-199, #620)
-- [x] `TJPARAM_MAXPIXELS` — Image size limit (`Decoder::set_max_pixels()`, `DecodeLimits::max_pixels`); the 8-bit `Decoder` path, `precision::decompress_{12,16}bit_with_limits`, and every `TjHandle` decompress entry point but `decompress_header` (as upstream), against the SOF (P4-199, #620)
+- [x] `TJPARAM_MAXMEMORY` — Memory limit (`Decoder::set_max_memory()`, `DecodeLimits::max_memory`); the 8-bit `Decoder` path, `precision::decompress_{12,16}bit_with_limits`, `TjHandle::decompress` / `decompress_12bit` / `decompress_16bit` / `decompress_to_yuv_planes` (and so `tj3DecompressToYUV8` / `tj3DecompressToYUVPlanes8`, P4-225), and `tj3Transform` (P4-227: source coefficients plus workspaces, as stock's memory manager counts them), each against an estimate of its own buffers — docs/STABILITY.md "What the memory budget covers" lists what is and is not counted (P4-199, #620)
+- [x] `TJPARAM_MAXPIXELS` — Image size limit (`Decoder::set_max_pixels()`, `DecodeLimits::max_pixels`); the 8-bit `Decoder` path, `precision::decompress_{12,16}bit_with_limits`, every `TjHandle` decompress entry point but `decompress_header` (as upstream), against the SOF (P4-199, #620), and `tj3Transform` (P4-227, #655)
 
 ### Marker Handling
 - [x] ICC profile reassembly from APP2 chunks
@@ -325,8 +326,8 @@
 - [x] `tj3CompressFromYUVPlanes8()` — Planar YUV → JPEG (`yuv::compress_from_yuv_planes()`)
 
 ### JPEG → YUV (decompress to YUV)
-- [x] `tj3DecompressToYUV8()` — JPEG → packed YUV buffer (`yuv::decompress_to_yuv()`; the two are not interchangeable — the C entry point rejects 4-component CMYK/YCCK frames per P4-125, the Rust function packs all four planes)
-- [x] `tj3DecompressToYUVPlanes8()` — JPEG → separate Y/Cb/Cr plane buffers (`yuv::decompress_to_yuv_planes()`; same divergence — the Rust function returns one plane per SOF component, so four for CMYK/YCCK)
+- [x] `tj3DecompressToYUV8()` — JPEG → packed YUV buffer (`TjHandle::decompress_to_yuv_planes()` publishes and applies the handle's limits, P4-225; the handle's scaling factor gives the scaled planes, byte-identical to stock, P4-234; `yuv::decompress_to_yuv()`; the two are not interchangeable — the C entry point rejects 4-component CMYK/YCCK frames per P4-125, the Rust function packs all four planes)
+- [x] `tj3DecompressToYUVPlanes8()` — JPEG → separate Y/Cb/Cr plane buffers (`TjHandle::decompress_to_yuv_planes()`, P4-225; scaled planes as stock writes them, P4-234; `yuv::decompress_to_yuv_planes()`; same divergence — the Rust function returns one plane per SOF component, so four for CMYK/YCCK)
 
 ### YUV → RGB (color conversion only, no JPEG)
 - [x] `tj3DecodeYUV8()` — Packed YUV → RGB (splits the packed buffer and runs `yuv::decode_yuv_planes()`; same reason as `tj3CompressFromYUV8` — P4-165)
@@ -419,14 +420,14 @@
 ## 13. Error Handling
 
 - [x] `Result<T, JpegError>` for all public operations
-- [x] `DecodeWarning` list: marker recovery (`ExtraneousData`) and lenient entropy warnings (`HuffmanError`, `TruncatedData`, `UnsupportedRecovered`)
+- [x] `DecodeWarning` list: marker recovery (`ExtraneousData`) and lenient entropy warnings (`HuffmanError`, `TruncatedData`, `UnsupportedRecovered`, `WarningsSuppressed`)
 - [x] Custom error handler — `ErrorHandler` trait
 - [ ] Classic codec failures consistently reach `error_exit()` — native typed errors exist; P4-100
 - [x] `emit_message()` callback — `ErrorHandler::emit_warning()` + `ErrorHandler::trace()`
 - [x] `output_message()` / `format_message()` — Rust `Display` trait on `JpegError` replaces the callbacks for the native API; the C ABI implements both per `jerror.c` — `format_message` renders upstream's text (P4-146, 2026-08-11), `output_message` writes it to stderr through the installed formatter (P4-146 criterion 4, 2026-08-13)
 - [x] `reset_error_mgr()` — N/A (Rust `Result` is stateless; no accumulated error state to reset)
 - [x] `trace_level` control — `ErrorHandler::trace()` callback with level parameter
-- [x] `num_warnings` counter — `Image.warnings` vec (count via `.len()`)
+- [x] `num_warnings` counter — `Image.warnings` vec (count via `.len()`, except that Huffman errors past `MAX_DECODE_WARNINGS` are one `WarningsSuppressed { count }` entry, P4-215)
 - [x] `msg_code` / `msg_parm` / `jpeg_message_table` — the native API uses typed `JpegError` / `DecodeWarning` enums instead of C integer codes + format strings; the C ABI carries all three, `jpeg_std_error` installing the 129-entry upstream table (P4-146, 2026-08-11)
 - [x] `tj3GetErrorStr()` / `tj3GetErrorCode()` — Rust `Result<T, JpegError>` with `Display` impl replaces C per-handle error getters
 - [x] Classic `jpeg_resync_to_restart()` default algorithm — suspending-source trace vs stock; native strategy extension remains available separately (P4-97, 2026-08-14)
@@ -446,7 +447,7 @@
 
 - [x] `tj3Init()` / `tj3Destroy()` — Handle lifecycle (`TjHandle::new()` / Drop)
 - [x] `tj3Set()` / `tj3Get()` — Generic parameter get/set (`TjHandle::set()` / `TjHandle::get()`)
-- [x] All 26 TJPARAM values wired end-to-end, except the restart parameters on 12- and 16-bit compression ([P4-252](last_mile/phase4.md#p4-252-12--and-16-bit-turbojpeg-compression-drops-the-restart-interval--open)) (`ColorSpace` with `TJCS_DEFAULT=-1`, `Subsampling`, density, ICC populated by `decompress()`; density and `ColorSpace` wired into `compress()`; `SaveMarkers` 0-4 behaviorally wired in decode; `Precision` read-only; `NoRealloc` N/A for Rust `Vec<u8>`). Every decompress entry point but the YUV ones (P4-225) — `decompress_header`, `decompress`, `decompress_12bit`, `decompress_16bit` — publishes the 13 parameters `setDecompParameters` writes, with the frame's values, cross-validated against stock 3.2.0 by `crates/libjpeg-turbo-rs-capi/tests/capi_decomp_parameters.rs` ([P4-199](last_mile/phase4.md#p4-199-setdecompparameters-publishes-thirteen-handle-parameters-our-8-bit-decode-publishes-eight-and-the-1216-bit-ones-publish-three-and-ignore-the-handles-limits--closed-2026-10-07), #620)
+- [x] All 26 TJPARAM values wired end-to-end, except the restart parameters on 12- and 16-bit compression ([P4-252](last_mile/phase4.md#p4-252-12--and-16-bit-turbojpeg-compression-drops-the-restart-interval--open)) (`ColorSpace` with `TJCS_DEFAULT=-1`, `Subsampling`, density, ICC populated by `decompress()`; density and `ColorSpace` wired into `compress()`; `SaveMarkers` 0-4 behaviorally wired in decode; `Precision` read-only; `NoRealloc` N/A for Rust `Vec<u8>`). Every decompress entry point — `decompress_header`, `decompress`, `decompress_12bit`, `decompress_16bit`, and the YUV ones through `decompress_header_info` / `decompress_to_yuv_planes` (P4-225) — publishes the 13 parameters `setDecompParameters` writes, with the frame's values, cross-validated against stock 3.2.0 by `crates/libjpeg-turbo-rs-capi/tests/capi_decomp_parameters.rs` ([P4-199](last_mile/phase4.md#p4-199-setdecompparameters-publishes-thirteen-handle-parameters-our-8-bit-decode-publishes-eight-and-the-1216-bit-ones-publish-three-and-ignore-the-handles-limits--closed-2026-10-07), #620)
 - [x] `tj3Compress12()` / `tj3Compress16()` / `tj3Decompress12()` / `tj3Decompress16()` — Multi-precision via `TjHandle` (`compress_12bit()` / `compress_16bit()` / `decompress_12bit()` / `decompress_16bit()`)
 - [x] `tj3SetICCProfile()` / `tj3GetICCProfile()` — encode-side ICC via handle + decompress populates handle ICC (`TjHandle::set_icc_profile()` / `TjHandle::icc_profile()`); upstream keeps those two in *separate* buffers (`iccBuf` and `decompICCBuf`, `turbojpeg.c:111`) and ours is one field, so a decode changes the profile a later compress embeds ([P4-198](last_mile/phase4.md#p4-198-tjhandle-merges-upstreams-two-icc-buffers-so-a-decode-changes-the-profile-a-later-compress-embeds--open), #619)
 - [x] `tj3SetScalingFactor()` / `tj3SetCroppingRegion()` — Decode options via handle (`TjHandle::set_scaling_factor()` / `TjHandle::set_cropping_region()`); the crop region follows `tj3SetCroppingRegion`'s rules and messages — an `x` off the scaled iMCU grid and a region past the scaled image are refused, a zero width/height runs to the edge; the C ABI validates at set time against the last header read, `TjHandle::decompress` against the image it decodes ([P4-197](last_mile/phase4.md#p4-197-a-cropping-region-whose-left-boundary-exceeds-the-scaled-width-decodes-to-zero-columns-and-trips-a-false-debug_assert--closed-2026-10-07), #618)

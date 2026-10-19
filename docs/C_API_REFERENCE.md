@@ -51,7 +51,7 @@
 | `XDENSITY` | Horizontal pixel density | `Encoder::density()` + `TjHandle` compress/decompress wiring | ✅ |
 | `YDENSITY` | Vertical pixel density | `Encoder::density()` + `TjHandle` compress/decompress wiring | ✅ |
 | `DENSITYUNITS` | 0=unknown, 1=ppi, 2=ppcm | `Encoder::density()` + `TjHandle` compress/decompress wiring | ✅ |
-| `MAXMEMORY` | Memory limit | `DecodeLimits::max_memory` / `Decoder::set_max_memory()`; `TjHandle::decompress` / `decompress_12bit` / `decompress_16bit` (P4-199, #620), not the YUV decompress entry points, which decode through the handle-free `decompress_to_yuv_planes`. A header-time *estimate* that counts the output buffer — upstream's bounds only its whole-image arrays — so the two refuse different frames; what each path counts is in docs/STABILITY.md "What the memory budget covers" | 🔶 |
+| `MAXMEMORY` | Memory limit | `DecodeLimits::max_memory` / `Decoder::set_max_memory()`; `TjHandle::decompress` / `decompress_12bit` / `decompress_16bit` (P4-199, #620) and `decompress_to_yuv_planes`, which the YUV decompress entry points decode through (P4-225, #652). A header-time *estimate* that counts the output buffer — upstream's bounds only its whole-image arrays — so the two refuse different frames; `tj3Transform`'s estimate (P4-227, #655) counts what stock's memory manager does and refuses the same sources at the measured boundaries. What each path counts is in docs/STABILITY.md "What the memory budget covers" | 🔶 |
 | `MAXPIXELS` | Image size limit | `DecodeLimits::max_pixels` / `Decoder::set_max_pixels()`; every `TjHandle` decompress entry point, against the SOF, after publishing, as `turbojpeg-mp.c:195-198` (P4-199, #620) | ✅ |
 | `SAVEMARKERS` | Marker preservation level 0-4 | `TjHandle` `TJPARAM_SAVEMARKERS` wired through `decompress()` → `Decoder::save_markers()` | ✅ |
 
@@ -119,7 +119,7 @@
 
 | C Function | Description | Rust | Status |
 |---|---|---|---|
-| `tj3Decompress8(handle, jpeg, size, dst, pitch, pf)` | Decompress JPEG to 8-bit pixels | `decompress()`, `decompress_to()`, `decompress_into()` (caller buffer, #354); `TjHandle::decompress()` publishes the 13 parameters `setDecompParameters` writes (P4-199, #620); decodes a 12-bit frame that stock refuses with `JERR_BAD_PRECISION` (P4-226) | 🔶 |
+| `tj3Decompress8(handle, jpeg, size, dst, pitch, pf)` | Decompress JPEG to 8-bit pixels | `decompress()`, `decompress_to()`, `decompress_into()` (caller buffer, #354); `TjHandle::decompress()` publishes the 13 parameters `setDecompParameters` writes (P4-199, #620); refuses, after publishing, a frame above 8 bits ("Unsupported JPEG data precision N") and a two-component `JCS_UNKNOWN` frame, as stock does (P4-226, #653) — `Decoder` / `decompress()` still downscale 12-bit; `TJPF_GRAY` from a colour frame is P4-167 | ✅ |
 | `tj3Decompress12(handle, jpeg, size, dst, pitch, pf)` | Decompress to 12-bit | `TjHandle::decompress_12bit()` / `decompress_12bit()` — **12-bit sources only**: upstream 3.2 also decompresses an 8-bit lossy JPEG to 12-bit output, which we refuse (P4-171); decodes only the first scan of a progressive or multi-scan frame (P4-223); refuses a stored cropping region instead of applying it (P4-219). Publishes the 13 parameters and applies the handle's limits (P4-199, #620) | 🔶 |
 | `tj3Decompress16(handle, jpeg, size, dst, pitch, pf)` | Decompress to 16-bit | `TjHandle::decompress_16bit()` / `decompress_16bit()` / `decompress_16bit_with_limits()` — publishes the 13 parameters and applies the handle's limits (P4-199, #620) |; whether a stored cropping region is refused (ours) or ignored (upstream) is P4-219, and its staging allocations are P4-216 | 🔶 |
 
@@ -127,8 +127,8 @@
 
 | C Function | Description | Rust | Status |
 |---|---|---|---|
-| `tj3DecompressToYUV8(handle, jpeg, size, dst, align)` | JPEG → packed YUV | `yuv::decompress_to_yuv()` — not interchangeable: the C entry point rejects 4-component CMYK/YCCK frames (P4-125), the Rust function packs all four planes | ✅ |
-| `tj3DecompressToYUVPlanes8(handle, jpeg, size, planes, strides)` | JPEG → planar YUV | `yuv::decompress_to_yuv_planes()` — same divergence; the Rust function returns one plane per SOF component, so four for CMYK/YCCK | ✅ |
+| `tj3DecompressToYUV8(handle, jpeg, size, dst, align)` | JPEG → packed YUV | `TjHandle::decompress_to_yuv_planes()` publishes the thirteen and applies the handle's limits (P4-225, #652); `yuv::decompress_to_yuv()` is the handle-free form and not interchangeable: the C entry point rejects 4-component CMYK/YCCK frames (P4-125), the Rust function packs all four planes. Honours `tj3SetScalingFactor`: the scaled planes, byte-identical to stock at all sixteen factors (P4-234, #667) | ✅ |
+| `tj3DecompressToYUVPlanes8(handle, jpeg, size, planes, strides)` | JPEG → planar YUV | `TjHandle::decompress_to_yuv_planes()` (P4-225, #652); `yuv::decompress_to_yuv_planes()` — same divergence; the Rust function returns one plane per SOF component, so four for CMYK/YCCK. Scaled planes as stock writes them (P4-234); a stride shorter than its plane is refused as upstream does | ✅ |
 
 ### Color Decode (YUV → RGB, no JPEG)
 
@@ -141,7 +141,7 @@
 
 | C Function | Description | Rust | Status |
 |---|---|---|---|
-| `tj3Transform(handle, jpeg, size, n, &dstBufs, &dstSizes, transforms)` | Lossless transform with options | `transform_jpeg()` / `transform_jpeg_with_options()` (all ops + all TJXOPT flags, including arithmetic/progressive output, + custom filter) | ✅ |
+| `tj3Transform(handle, jpeg, size, n, &dstBufs, &dstSizes, transforms)` | Lossless transform with options | `transform_jpeg()` / `transform_jpeg_with_options()` (all ops + all TJXOPT flags, including arithmetic/progressive output, + custom filter). The C entry point applies the handle's `TJPARAM_MAXPIXELS` / `SCANLIMIT` / `MAXMEMORY` to the source and its `PROGRESSIVE` / `ARITHMETIC` / `OPTIMIZE` / `RESTARTBLOCKS` / `RESTARTROWS` to the output, byte-exact vs stock (P4-227, #655); the handle's `SAVEMARKERS` level and ICC profile are not applied (P4-235, #668). Crop regions follow `jtransform_request_workspace`'s rules — a zero `r.w` / `r.h` runs to the edge, an out-of-range region is "Invalid crop request" (P4-240, #675) | 🔶 |
 | `tj3TransformBufSize(handle, transform)` | Estimate output buffer size | `transform_buf_size()` | ✅ |
 
 ### Error Handling
@@ -490,7 +490,7 @@
 | `JQUANT_TBL` | Quantization table (64 values + sent_table) | Internal `[u16; 64]` arrays | ✅ |
 | `JHUFF_TBL` | Huffman table (bits[17] + huffval[256]) | `HuffmanTable` / `HuffTable` | ✅ |
 | `jpeg_component_info` | Per-component metadata | `ComponentInfo` | ✅ |
-| `jpeg_scan_info` | Scan script entry (components, Ss/Se/Ah/Al) | `ScanScript` / `ScanInfo`; `Encoder::scan_script` is ignored on the arithmetic, RGB-direct and custom-sampling progressive paths (P4-210, #636); classic scanline wiring remains P4-91 | 🔶 |
+| `jpeg_scan_info` | Scan script entry (components, Ss/Se/Ah/Al) | `ScanScript` / `ScanInfo`; `Encoder::scan_script` is honoured by every progressive encode, including explicit sampling factors, Huffman/arithmetic and four-component CMYK (P4-210/P4-237, #636/#673); sequential and lossless requests remain refused; classic scanline wiring remains P4-91 | 🔶 |
 | `jpeg_marker_struct` | Saved marker (code, length, data, next) | Native markers exist; classic incremental pointer stability remains P4-26 | 🔶 |
 | `jpeg_common_struct` | Common fields (err, mem, progress) | Native equivalents exist; decompressor `global_state` matches stock (P4-104 closed 2026-08-14) except `DSTATE_BUFIMAGE`/`BUFPOST` (P4-13); classic error/progress contracts remain P4-100/P4-111 | 🔶 |
 | `jpeg_compress_struct` | Full compression state (~50 fields) | `Encoder` / `ScanlineEncoder`; residual classic option/state gaps are P4-84..P4-111 | 🔶 |

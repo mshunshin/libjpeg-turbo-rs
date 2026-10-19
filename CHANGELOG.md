@@ -10,6 +10,8 @@ and `git log` between tags.
 
 ### Added
 
+- **`TjHandle::scaling_factor`** returns the factor `set_scaling_factor`
+  set; `TjHandle::decompress_to_yuv_planes` now applies it (P4-234, #667).
 - **Supported root paths for module-only APIs** (P4-222): `libjpeg_turbo_rs::yuv`
   (`encode_yuv`, `compress_from_yuv`, `decompress_to_yuv`, `decode_yuv` and
   their `*_planes` forms), `StreamingDecoder`, `CompressParams` and
@@ -77,7 +79,75 @@ and `git log` between tags.
   skipping. MSVC only — no MinGW bundle — and the DLL links the dynamic
   Visual C++ runtime, as upstream's does.
 
+### Security
+
+- **Heap overflow in `tj3DecompressToYUV8` / `tj3DecompressToYUVPlanes8`**
+  (P4-234, #667; every published capi, 0.1.0-0.1.2). Both ignored the
+  handle's scaling factor and wrote full-size planes into a buffer the caller
+  had sized, as `turbojpeg.h` documents, for the scaled image — 6144 bytes
+  into a 1536-byte buffer for a 64x64 4:2:0 frame at 1/2. The legacy
+  `tjDecompressToYUV2` / `tjDecompressToYUVPlanes` shim recipe in
+  `docs/ABI_COMPATIBILITY.md` reaches the same call. `tj3DecompressToYUVPlanes8`
+  also honoured a stride shorter than its plane, running the last row past
+  a buffer sized `stride * height`, and `tj3DecompressToYUV8` grew its packed
+  planes infallibly from the caller's `align`, so an alignment of 2^30 aborted
+  the process. Both now decode the planes of the *scaled* frame, writing
+  exactly the `tj3YUVBufSize(TJSCALED(w), align, TJSCALED(h), subsamp)`
+  bytes, byte-identical to stock 3.2.0 at all sixteen scaling factors.
+  **Breaking (behaviour):** a stride shorter than its plane's width, or
+  negative, is
+  refused with "Invalid argument" as upstream refuses it, and padded planes
+  past `INT_MAX` are refused with "Image or row alignment is too large", as
+  upstream refuses them. The overruns are pinned in the C-boundary misuse
+  harness (`yuv_overrun`), which the sanitizer workflow runs under ASan with
+  every buffer flush against a guard page.
+
 ### Changed
+
+- **Breaking (behaviour): non-standard `Encoder::sampling_factors` compose
+  with every mode** (P4-236, #664).
+  - Factors that map to no standard `Subsampling` (3x2, 1x4, a component 0
+    that is not the largest, …) used to take a baseline-only encoder.
+    `progressive`, `arithmetic`, `lossless`, restart intervals, optimized
+    Huffman, the DCT method and custom or 16-bit quantisation tables were
+    dropped, and `encode` returned an SOF0 stream.
+  - These now code as requested, byte-identical to `cjpeg -sample`.
+  - `lossless(true)` ignores the factors, as C does. A grayscale lossless
+    encode with an explicit sampling request no longer has its SOF patched to
+    that factor.
+  - Factor sets C refuses (more than 10 blocks per MCU) return `CorruptData`.
+  - Custom progressive scripts, smoothing, RGB-direct, four-factor CMYK,
+    grayscale conversion and installed Huffman tables now compose too
+    (P4-237, #673). The Rust-only `fancy_downsampling` prefilter remains refused.
+    Smoothing follows C's full-size/h2v2-only kernel selection and context-row
+    padding; single-component DC scans traverse their component's block grid.
+    The 10-block MCU limit is checked per scan, allowing larger factors when
+    the script uses only non-interleaved scans.
+  - Stock 3.2.0 ARM NEON mis-selects input rows for h2v2 components with
+    vertical factor > 1; Rust follows scalar C. This byte-parity exception is
+    tracked separately as P4-241 (#679).
+
+- **Breaking (behaviour): `Encoder::scan_script` is honoured on every
+  progressive path, and refused where none can follow it** (P4-210, #636).
+  The arithmetic-coded progressive encode (YCbCr, grayscale and RGB-direct)
+  and the Huffman RGB-direct one used to write C's default script and return
+  `Ok`; they now follow and validate the caller's script, byte-identical to
+  stock `cjpeg -scans` with `-arithmetic` / `-rgb`, and an invalid one returns
+  `JpegError::InvalidScanScript`. A script with `progressive(false)`, with
+  `lossless(true)` returns `JpegError::Unsupported` instead of being ignored.
+  Non-interleaved DC scans on the arithmetic path walk the component's own
+  block grid, as the Huffman path does since P4-211.
+
+- **Breaking (Rust API): a lenient decode's warning list is bounded, and
+  `DecodeWarning` is `#[non_exhaustive]`** (P4-215, #641). A stream corrupt in
+  every MCU used to return one `DecodeWarning::HuffmanError` (with its own
+  heap string) per MCU — about 67 M for a 65500x65500 4:4:4 frame. A decode
+  now records the first `MAX_DECODE_WARNINGS` (64, exported at the root) and
+  follows them with one new `DecodeWarning::WarningsSuppressed { count }` for
+  the rest, as C prints only the first warning and counts the others.
+  `TruncatedData` and `UnsupportedRecovered` are never suppressed. Exhaustive
+  `match`es on `DecodeWarning` need a wildcard arm. The list is also moved
+  into the `Image` instead of cloned.
 
 - **Zero-filled `u8` decode buffers are allocated with `alloc_zeroed` again**
   (P4-228, #659). P4-209 made the owned decode output and the decoder planes
@@ -311,7 +381,7 @@ and `git log` between tags.
   12/16-bit entry points three; all of them, and `decompress_header` /
   `tj3DecompressHeader`, now publish the thirteen upstream writes
   (`turbojpeg.c:514-536`) with the frame's values (the YUV decompressors
-  still publish nothing, P4-225), cross-validated against
+  followed under P4-225, below), cross-validated against
   stock TurboJPEG 3.2.0 (`crates/libjpeg-turbo-rs-capi/tests/capi_decomp_parameters.rs`).
   Callers see: `TJPARAM_PROGRESSIVE`, `ARITHMETIC`, `LOSSLESS`, `LOSSLESSPSV`
   and `LOSSLESSPT` set from the stream — `LOSSLESSPT` is the first scan's
@@ -347,6 +417,86 @@ and `git log` between tags.
   TurboJPEG cannot name, as upstream's does. Every decompress entry point
   reads the header the same way first, so a stream over `TJPARAM_SCANLIMIT`
   is now refused after publishing, as upstream's is.
+- **Breaking (behaviour): `tj3Decompress8` refuses a frame above 8 bits and a
+  two-component frame** (P4-226, #653). `TjHandle::decompress` /
+  `tj3Decompress8` downscaled a 12-bit frame and returned 0 where stock
+  TurboJPEG returns -1 ("Unsupported JPEG data precision 12"); it now refuses
+  every frame above 8 bits, lossy or lossless, after publishing, so a caller
+  reading `TJPARAM_PRECISION` routes to `tj3Decompress12` / `16`. A
+  two-component frame (libjpeg's `JCS_UNKNOWN`) now publishes `TJCS_DEFAULT`
+  as the P4-199 entry above said it did — it published YCbCr — so
+  `tj3DecompressHeader` refuses it ("Could not determine colorspace of JPEG
+  image") and every pixel decompress refuses it with "Unsupported color
+  conversion request", as stock 3.2.0 does. `Decoder` and `decompress()`
+  still downscale a 12-bit frame; only the TurboJPEG-shaped entry point
+  changed.
+- **Breaking (behaviour): `tj3DecompressToYUV8` / `tj3DecompressToYUVPlanes8`
+  publish the thirteen parameters and honour the handle's limits** (P4-225,
+  #652). They published nothing, so `tj3Get` after a YUV decompress returned
+  whatever the previous call left, and they decoded under the default limits,
+  ignoring `TJPARAM_SCANLIMIT` and `TJPARAM_MAXMEMORY`. Both now publish what
+  `setDecompParameters` writes (and the ICC profile) right after the header
+  read, then apply `TJPARAM_MAXPIXELS` ("Image is too large"), then decode
+  under `TJPARAM_SCANLIMIT` and `TJPARAM_MAXMEMORY`, cross-validated against
+  stock 3.2.0. A frame stock's YUV path cannot describe is refused with
+  stock's message: an unknown subsampling ("Could not determine subsampling
+  level of JPEG image"), a lossless frame ("Requested features are
+  incompatible"). `tj3DecompressToYUVPlanes8` now refuses a NULL
+  `dstPlanes[0]` at entry, before the header read, as upstream does. New
+  Rust API: `TjHandle::decompress_header_info` and
+  `TjHandle::decompress_to_yuv_planes`, which also applies
+  `TJPARAM_FASTDCT` (byte-exact against stock) and
+  `TJPARAM_STOPONWARNING`, which refuses a frame of more than
+  three components where the handle-free `yuv::decompress_to_yuv_planes`
+  returns four planes.
+- **Breaking (behaviour): `tj3Transform` applies the handle's limits and
+  output parameters** (P4-227, #655). It read none of them. It now refuses a
+  source over `TJPARAM_MAXPIXELS` ("tj3Transform(): Image is too large"),
+  over `TJPARAM_MAXMEMORY` ("Memory limit exceeded": the source's
+  coefficient arrays plus each transform's workspace, as stock counts them)
+  or with more scans than `TJPARAM_SCANLIMIT` ("Progressive JPEG image has
+  more than N scans") — the memory estimate also counts the markers
+  upstream saves for copying — and its output takes the handle's
+  `TJPARAM_PROGRESSIVE`, `TJPARAM_ARITHMETIC`, `TJPARAM_OPTIMIZE`,
+  `TJPARAM_RESTARTBLOCKS` and `TJPARAM_RESTARTROWS`, so a decompress that
+  published `PROGRESSIVE` = 1 on the same handle now makes the transform's
+  output progressive, as upstream's does. Byte-exact against stock 3.2.0.
+  Every transform's arguments are now validated before any output is
+  produced. `TransformOptions::perfect` follows
+  `jtransform_perfect_transform`: a 90- or 270-degree rotation needs only the
+  edge it moves to be whole iMCUs, and a grayscale output of a YCbCr source
+  uses an 8x8 iMCU; a one-component source whose SOF declares 2x2 (or any)
+  sampling is transformed and written as 1x1, as jpegtran does — it used to
+  keep the SOF's iMCU, so a non-perfect flip left a ragged block column
+  unmirrored and the output differed from jpegtran's; `-trim` on a grayscale
+  output of a YCbCr source uses the one-block iMCU too (it trimmed a 72-wide
+  4:2:0 frame to 64 where jpegtran keeps 72), so `-perfect` transforms jpegtran accepts are no longer
+  refused. `transform_jpeg_with_options` with `restart_interval` 0 no longer
+  copies the source's DRI into the output — its own documentation said 0
+  disables restart markers, and `jpegtran` (without `-restart`) and
+  `tj3Transform` both drop it, because `jpeg_copy_critical_parameters` does not
+  copy `restart_interval`. A crop region upstream refuses is reported as
+  "Invalid crop request" before any limit, and a crop whose `x` / `y` is not
+  a multiple of the destination iMCU is refused with upstream's "To crop this
+  JPEG image, x must be a multiple of …" — it used to be aligned down
+  silently. `TJPARAM_RESTARTBLOCKS` and `TJPARAM_RESTARTROWS` now clear each
+  other when set nonzero and refuse values outside 0-65535, as upstream's
+  `tj3Set` does, so `tj3Get` and every compress or transform see the
+  interval set last.
+- **Breaking (behaviour): crop regions follow jpegtran's rules** (P4-240,
+  #675). `TransformOptions::crop` with a `width` or `height` of 0 now runs to
+  the edge of the transformed image, as jpegtran's omitted `W` / `H` does; it
+  used to produce an empty or remainder-wide image. A region jpegtran refuses
+  — an origin outside the transformed image, or a region running past it —
+  is now `JpegError::InvalidCropRegion("Invalid crop request")` instead of
+  being clamped to the image; crop *expansion* (legal in jpegtran 3.2 for an
+  untransformed image) is still clamped, or refused with
+  `JpegError::Unsupported` when its origin lies outside the image (P4-173).
+  `tj3Transform` accepts a
+  zero `r.w` / `r.h` as "to the edge" (it returned -1), and
+  `tj3TransformBufSize` sizes that region as upstream does (it sized the
+  whole frame) and, like upstream's `getTransformedSpecs`, returns 0 with
+  upstream's message for a region it refuses. Byte-exact against `jpegtran -crop` and stock `tj3Transform`.
 - An allocator refusal during a decode is reported as
   `JpegError::AllocationFailed` instead of aborting the process (P4-209,
   #632). `decompress` / `Decoder::decode_image` allocated their destination
