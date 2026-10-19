@@ -9,6 +9,28 @@ impl<'a> Decoder<'a> {
     /// resolution, without performing color conversion or upsampling.
     /// This matches libjpeg-turbo's `jpeg_read_raw_data()` functionality.
     pub fn decode_raw(self) -> Result<crate::api::raw_data::RawImage> {
+        self.decode_raw_with_warnings(8).map(|(raw, _warnings)| raw)
+    }
+
+    /// [`Self::decode_raw`] with every component's blocks reconstructed at
+    /// `block_size` x `block_size` (1..=16, the scaled IDCTs), also returning
+    /// the warnings the entropy decode recovered from — for
+    /// `TjHandle::decompress_to_yuv_planes`, which emits planes at the handle's
+    /// scaling factor and honours `TJPARAM_STOPONWARNING`.
+    ///
+    /// One size for every component is what TurboJPEG's raw path uses:
+    /// `jpeg_calc_output_dimensions` would give a subsampled component a
+    /// larger IDCT only when it is subsampled both ways, and for exactly those
+    /// subsamplings (4:2:0, 4:1:0, 2:4) `tj3DecompressToYUVPlanes8` forces it
+    /// back to the luma size (`turbojpeg.c:2299-2316`), so the chroma planes
+    /// stay subsampled (P4-234).
+    pub(crate) fn decode_raw_with_warnings(
+        self,
+        block_size: usize,
+    ) -> Result<(
+        crate::api::raw_data::RawImage,
+        Vec<crate::common::error::DecodeWarning>,
+    )> {
         self.check_marker_warnings(self.stop_on_warning)?;
         self.check_header_limits()?;
         let frame = &self.metadata.frame;
@@ -33,9 +55,28 @@ impl<'a> Decoder<'a> {
             .map(|c| c.vertical_sampling as usize)
             .max()
             .unwrap_or(1);
-        let block_size: usize = 8;
-        // Raw data decode always uses full-size (8x8) IDCT for all components
+        if !(1..=16).contains(&block_size) {
+            return Err(JpegError::Unsupported(format!(
+                "raw decode block size {block_size} (1 to 16 supported)"
+            )));
+        }
         let comp_block_sizes: Vec<usize> = vec![block_size; num_components];
+        // At a block size above 8 the planes outgrow the frame (2x at 16), so
+        // their spans are checked before any is sized: on a 32-bit target a
+        // frame the pixel limit admits can otherwise wrap a plane's length.
+        for component in &frame.components {
+            crate::common::layout::checked_span(
+                &[
+                    width.div_ceil(max_h * 8),
+                    component.horizontal_sampling as usize,
+                    block_size,
+                    height.div_ceil(max_v * 8),
+                    component.vertical_sampling as usize,
+                    block_size,
+                ],
+                "raw component plane",
+            )?;
+        }
         let mcu_width: usize = max_h * 8;
         let mcu_height: usize = max_v * 8;
         let mcus_x: usize = width.div_ceil(mcu_width);
@@ -54,7 +95,7 @@ impl<'a> Decoder<'a> {
                     })
             })
             .collect::<Result<Vec<_>>>()?;
-        let (component_planes, _warnings) = if self.metadata.is_arithmetic && frame.is_progressive {
+        let (component_planes, warnings) = if self.metadata.is_arithmetic && frame.is_progressive {
             self.decode_arithmetic_progressive_planes(
                 frame,
                 &quant_tables,
@@ -102,13 +143,16 @@ impl<'a> Decoder<'a> {
             plane_widths.push(mcus_x * comp.horizontal_sampling as usize * comp_block_sizes[ci]);
             plane_heights.push(mcus_y * comp.vertical_sampling as usize * comp_block_sizes[ci]);
         }
-        Ok(crate::api::raw_data::RawImage {
-            planes: component_planes,
-            plane_widths,
-            plane_heights,
-            width,
-            height,
-            num_components,
-        })
+        Ok((
+            crate::api::raw_data::RawImage {
+                planes: component_planes,
+                plane_widths,
+                plane_heights,
+                width,
+                height,
+                num_components,
+            },
+            warnings,
+        ))
     }
 }
