@@ -8,6 +8,8 @@ and `git log` between tags.
 
 ## [Unreleased]
 
+## [0.9.0] - 2026-11-01
+
 ### Added
 
 - **Lenient 12-bit and lossless decodes** (P4-254):
@@ -337,6 +339,31 @@ and `git log` between tags.
   runs system/Rust bidirectional cross-decodes.
 
 ### Fixed
+- **Progressive scans keep their AC table selector** (#696): an AC scan whose
+  band ended below coefficient 63 declared `Ta = 0` whatever table coded it.
+  A custom `scan_script` that splits chroma bands, and a default progressive
+  transcode of a YCCK frame, produced streams this crate rejected and djpeg
+  decoded with damaged chroma. Arithmetic streams decoded correctly but
+  differed from cjpeg in that byte. Files written before this fix stay damaged.
+- **12-bit decode matches libjpeg at the image edge and in colour**
+  (`precision::decompress_12bit` and everything built on it: `TjHandle` and
+  `tj3Decompress12`, `jpeg12_read_scanlines`, `Decoder` on a 12-bit frame).
+  - The last chroma column or row of a subsampled frame whose width or height
+    is even but not a whole number of MCUs was blended with MCU padding
+    (P4-263, #693); 4:2:0 frames four pixels wide or narrower and 4:2:2
+    frames three or four pixels wide were filtered where libjpeg replicates.
+  - The source colour space is classified as libjpeg does (P4-264, #694): an
+    RGB-coded frame (`cjpeg -rgb`) is returned unconverted, where it used to
+    be colour-converted a second time, and a YCCK frame is converted to CMYK,
+    where it used to come back as YCCK.
+  - **Behaviour:** `Decoder` / `decompress`, and so the `image` adapter,
+    refuse a 12-bit frame of other than one or three components with
+    `Unsupported`; a CMYK or YCCK frame
+    used to come back as `Ok` with its pixels misread as RGB. Its samples are
+    available through `precision::decompress_12bit`.
+- `JpegCoefficients::quant_tables` and `EncoderConfig::quant_tables` were
+  documented as zigzag order; they have always been in natural (row-major)
+  order. Only the documentation changed.
 - **Breaking (behaviour): a short entropy-coded segment is refused, or decoded
   as djpeg decodes it** (P4-254). When the data ended before the last MCU —
   the stream stopped, or an EOI came early — the sequential Huffman decoders
@@ -942,6 +969,7 @@ djpeg/cjpeg/jpegtran parity, Pillow/libtiff integration, panic guards
 on all C entry points.
 
 [Unreleased]: https://github.com/developer0hye/libjpeg-turbo-rs/compare/v0.8.0...HEAD
+[0.9.0]: https://github.com/developer0hye/libjpeg-turbo-rs/compare/v0.8.0...v0.9.0
 [0.8.0]: https://github.com/developer0hye/libjpeg-turbo-rs/compare/v0.7.0...v0.8.0
 [0.7.0]: https://github.com/developer0hye/libjpeg-turbo-rs/compare/v0.6.3...v0.7.0
 [0.6.3]: https://github.com/developer0hye/libjpeg-turbo-rs/compare/v0.6.2...v0.6.3
